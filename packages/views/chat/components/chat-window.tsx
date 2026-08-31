@@ -26,22 +26,11 @@ import {
 } from "@multica/core/agents";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { useAppForeground } from "../../common/use-app-foreground";
-import {
-  RowActionsMenu,
-  handleRowActivationKey,
-  type RowActionItem,
-} from "../../common/row-actions-menu";
-import {
-  PickerEmpty,
-  PickerItem,
-  PickerSection,
-  PropertyPicker,
-} from "../../issues/components/pickers/property-picker";
-import { matchesPinyin } from "../../editor/extensions/pinyin-match";
 import { OfflineBanner } from "./offline-banner";
 import { NoAgentBanner } from "./no-agent-banner";
 import { ArchivedAgentBanner } from "./archived-agent-banner";
 import { RuntimeRequiredBanner } from "./runtime-required-banner";
+import { AgentPicker } from "./new-chat-button";
 import {
   chatSessionsOptions,
   chatMessagesPageOptions,
@@ -225,20 +214,37 @@ export function ChatWindow() {
   // render some *other* available agent — wrong avatar/name and a send that
   // targets the wrong agent. Binding to the session's real agent keeps it
   // honest; the archived state then makes the conversation read-only.
-  const sessionAgent = currentSession
+  const isDirectChat =
+    !!currentSession?.target_user_id || (!!currentSession && !currentSession.agent_id);
+
+  const otherUserId = isDirectChat
+    ? currentSession?.creator_id === user?.id
+      ? currentSession?.target_user_id
+      : currentSession?.creator_id
+    : null;
+
+  const otherMember = otherUserId
+    ? members.find((m) => m.user_id === otherUserId)
+    : null;
+
+  const sessionAgent = currentSession && currentSession.agent_id
     ? agents.find((a) => a.id === currentSession.agent_id) ?? null
     : null;
-  const isAgentArchived = !!sessionAgent?.archived_at;
+  const isAgentArchived = isDirectChat ? false : !!sessionAgent?.archived_at;
 
   // Resolve selected agent: open session's agent → stored preference → first
   // available. New chats have no session, so they fall through to the picker.
-  const activeAgent =
-    sessionAgent ??
-    availableAgents.find((a) => a.id === selectedAgentId) ??
-    availableAgents[0] ??
-    null;
-  const activeAgentRuntimeBound =
-    !!activeAgent && isAgentRuntimeBound(activeAgent);
+  const activeAgent = isDirectChat
+    ? null
+    : (sessionAgent ??
+      availableAgents.find((a) => a.id === selectedAgentId) ??
+      availableAgents[0] ??
+      null);
+  const activeAgentRuntimeBound = isDirectChat
+    ? true
+    : !!activeAgent && isAgentRuntimeBound(activeAgent);
+
+  const uploadEnabled = isDirectChat || !!activeAgent;
 
   const projectContextSupport = useChatProjectContextSupport(wsId, activeAgent);
 
@@ -247,7 +253,7 @@ export function ChatWindow() {
   // few hundred ms before the agent list query resolves. Only `"none"`
   // (server confirmed: zero usable agents) drives the disabled UI.
   const agentAvailability = useWorkspaceAgentAvailability();
-  const noAgent = agentAvailability === "none";
+  const noAgent = isDirectChat ? false : agentAvailability === "none";
 
   // Presence drives both the avatar status dot (via ActorAvatar) and the
   // OfflineBanner / TaskStatusPill availability copy. `useAgentPresenceDetail`
@@ -356,6 +362,8 @@ export function ChatWindow() {
       ) {
         return activeSessionId;
       }
+      // Direct chats always have an existing session (created on member pick);
+      // if we reach here without one there's nothing to create without an agent.
       if (!activeAgent) return null;
       if (sessionPromiseRef.current) return sessionPromiseRef.current;
 
@@ -397,7 +405,7 @@ export function ChatWindow() {
       commitInput?: (options?: { extraDraftKeys?: string[]; clearEditor?: boolean }) => void,
       draftAttachments: Attachment[] = [],
     ): Promise<boolean> => {
-      if (!activeAgent) {
+      if (!activeAgent && !isDirectChat) {
         apiLogger.warn("sendChatMessage skipped: no active agent");
         return false;
       }
@@ -407,7 +415,7 @@ export function ChatWindow() {
       if (isAgentArchived) {
         apiLogger.warn("sendChatMessage skipped: agent is archived", {
           sessionId: activeSessionId,
-          agentId: activeAgent.id,
+          agentId: activeAgent?.id,
         });
         return false;
       }
@@ -429,7 +437,7 @@ export function ChatWindow() {
       apiLogger.info("sendChatMessage.start", {
         sessionId: activeSessionId,
         isNewSession,
-        agentId: activeAgent.id,
+        agentId: activeAgent?.id ?? "direct",
         contentLength: finalContent.length,
         attachmentCount: attachmentIds?.length ?? 0,
       });
@@ -505,14 +513,17 @@ export function ChatWindow() {
       // arrival order, and this richer row (it carries the draft attachments)
       // is never downgraded by the echo, which has no attachments field.
       upsertChatMessageToCaches(qc, sessionId, sent, { seedIfMissing: true });
-      seedAcceptedPendingTask(qc, sessionId, {
-        task_id: result.task_id,
-        created_at: result.created_at,
-        message_id: result.message_id,
-        content: finalContent,
-        supports_queue: result.supports_queue,
-        queued: result.queued,
-      });
+      // Direct chats return empty task_id — skip pending task seeding.
+      if (result.task_id) {
+        seedAcceptedPendingTask(qc, sessionId, {
+          task_id: result.task_id,
+          created_at: result.created_at,
+          message_id: result.message_id,
+          content: finalContent,
+          supports_queue: result.supports_queue,
+          queued: result.queued,
+        });
+      }
       // Cache primed → publish the new active session, but only if the user
       // hasn't navigated away mid-send. Compare the live store against the
       // closure-captured target; see isStillOnComposeTarget for the rule, which
@@ -642,7 +653,7 @@ export function ChatWindow() {
     (session: ChatSession) => {
       // Sessions are bound 1:1 to an agent — picking a session from a
       // different agent implicitly switches the agent too.
-      if (activeAgent && session.agent_id !== activeAgent.id) {
+      if (session.agent_id && activeAgent && session.agent_id !== activeAgent.id) {
         uiLogger.info("selectSession (cross-agent)", {
           from: activeAgent.id,
           toAgent: session.agent_id,
@@ -939,17 +950,17 @@ export function ChatWindow() {
         onSend={handleSend}
         restoreDraftRequest={restoreDraftRequest}
         onRestoreDraftApplied={handleRestoreDraftApplied}
-        uploadEnabled={!!activeAgent}
+        uploadEnabled={uploadEnabled}
         onStop={handleStop}
         isRunning={!!pendingTaskId}
         allowSubmitWhileRunning={pendingTask?.supports_queue === true}
         disabled={
-          isSessionArchived || isAgentArchived || !activeAgentRuntimeBound
+          isSessionArchived || (!isDirectChat && (isAgentArchived || !activeAgentRuntimeBound))
         }
-        noAgent={noAgent}
-        agentArchived={isAgentArchived}
-        agentRuntimeRequired={!activeAgentRuntimeBound}
-        agentName={activeAgent?.name}
+        noAgent={isDirectChat ? false : noAgent}
+        agentArchived={isDirectChat ? false : isAgentArchived}
+        agentRuntimeRequired={isDirectChat ? false : !activeAgentRuntimeBound}
+        agentName={isDirectChat ? (otherMember?.name || otherMember?.email) : activeAgent?.name}
         projects={projects}
         projectId={activeProjectId}
         onProjectChange={handleProjectChange}
@@ -961,8 +972,10 @@ export function ChatWindow() {
           <AgentDropdown
             agents={availableAgents}
             activeAgent={activeAgent}
+            activeSession={currentSession}
             userId={user?.id}
             onSelect={handleSelectAgent}
+            onSelectSession={handleSelectSession}
           />
         }
         contextItems={contextItems}
@@ -980,148 +993,78 @@ export function ChatWindow() {
 export function AgentDropdown({
   agents,
   activeAgent,
+  activeSession,
   userId,
   onSelect,
+  onSelectSession,
 }: {
   agents: Agent[];
   activeAgent: Agent | null;
+  activeSession?: ChatSession | null;
   userId: string | undefined;
   onSelect: (agent: Agent) => void;
+  onSelectSession?: (session: ChatSession) => void;
 }) {
   const { t } = useT("chat");
-  const [open, setOpen] = useState(false);
-  const [filter, setFilter] = useState("");
-  // Split into the user's own agents and everyone else so the menu groups
-  // them — matches the old AgentSelector layout.
-  const { mine, others } = useMemo(() => {
-    const mine: Agent[] = [];
-    const others: Agent[] = [];
-    for (const a of agents) {
-      if (a.owner_id === userId) mine.push(a);
-      else others.push(a);
-    }
-    return { mine, others };
-  }, [agents, userId]);
+  const wsId = useWorkspaceId();
+  const { data: members = [] } = useQuery(memberListOptions(wsId));
 
-  const query = filter.trim().toLowerCase();
-  const matches = (name: string) =>
-    !query || name.toLowerCase().includes(query) || matchesPinyin(name, query);
-  const filteredMine = mine.filter((agent) => matches(agent.name));
-  const filteredOthers = others.filter((agent) => matches(agent.name));
+  const otherUserId = activeSession?.target_user_id
+    ? activeSession.creator_id === userId
+      ? activeSession.target_user_id
+      : activeSession.creator_id
+    : null;
 
-  const handlePick = (agent: Agent) => {
-    onSelect(agent);
-    setOpen(false);
-  };
+  const otherMember = otherUserId ? members.find((m) => m.user_id === otherUserId) : null;
 
-  if (!activeAgent) {
-    return <span className="text-caption text-muted-foreground">{t(($) => $.window.no_agents)}</span>;
-  }
+  const triggerContent = activeAgent ? (
+    <>
+      <ActorAvatar
+        actorType="agent"
+        actorId={activeAgent.id}
+        size="md"
+        enableHoverCard
+        showStatusDot
+      />
+      <span className="text-caption font-medium max-w-28 truncate">{activeAgent.name}</span>
+      <ChevronDown className="size-3 text-muted-foreground shrink-0" />
+    </>
+  ) : otherUserId ? (
+    <>
+      <ActorAvatar
+        actorType="member"
+        actorId={otherUserId}
+        size="md"
+        enableHoverCard
+        showStatusDot
+      />
+      <span className="text-caption font-medium max-w-28 truncate">
+        {otherMember?.name || otherMember?.email || "成员私聊"}
+      </span>
+      <ChevronDown className="size-3 text-muted-foreground shrink-0" />
+    </>
+  ) : (
+    <span className="text-caption text-muted-foreground">{t(($) => $.window.no_agents)}</span>
+  );
 
   return (
-    <PropertyPicker
-      open={open}
-      onOpenChange={setOpen}
-      width="w-64"
-      align="start"
+    <AgentPicker
+      agents={agents}
+      userId={userId}
+      currentAgentId={activeAgent?.id}
+      onSelect={onSelect}
+      onSelectMember={onSelectSession}
       side="top"
-      searchable
-      searchPlaceholder={t(($) => $.window.agent_filter_placeholder)}
-      onSearchChange={setFilter}
+      align="start"
       triggerRender={
         <button
           type="button"
           className="flex items-center gap-1.5 rounded-md px-1.5 py-1 -ml-1 cursor-pointer outline-none transition-colors hover:bg-accent aria-expanded:bg-accent"
         />
       }
-      trigger={
-        <>
-          <ActorAvatar
-            actorType="agent"
-            actorId={activeAgent.id}
-            size="md"
-            enableHoverCard
-            showStatusDot
-          />
-          <span className="text-caption font-medium max-w-28 truncate">{activeAgent.name}</span>
-          <ChevronDown className="size-3 text-muted-foreground shrink-0" />
-        </>
-      }
-    >
-      {filteredMine.length === 0 && filteredOthers.length === 0 ? (
-        <PickerEmpty />
-      ) : (
-        <>
-          {filteredMine.length > 0 && (
-            <PickerSection label={t(($) => $.window.my_agents)}>
-              {filteredMine.map((agent) => (
-                <AgentPickerItem
-                  key={agent.id}
-                  agent={agent}
-                  isCurrent={agent.id === activeAgent.id}
-                  onSelect={handlePick}
-                />
-              ))}
-            </PickerSection>
-          )}
-          {filteredOthers.length > 0 && (
-            <PickerSection label={t(($) => $.window.others)}>
-              {filteredOthers.map((agent) => (
-                <AgentPickerItem
-                  key={agent.id}
-                  agent={agent}
-                  isCurrent={agent.id === activeAgent.id}
-                  onSelect={handlePick}
-                />
-              ))}
-            </PickerSection>
-          )}
-        </>
-      )}
-    </PropertyPicker>
+      trigger={triggerContent}
+    />
   );
-}
-
-function AgentPickerItem({
-  agent,
-  isCurrent,
-  onSelect,
-}: {
-  agent: Agent;
-  isCurrent: boolean;
-  onSelect: (agent: Agent) => void;
-}) {
-  const { t } = useT("chat");
-  const runtimeBound = isAgentRuntimeBound(agent);
-  return (
-    <PickerItem
-      selected={isCurrent}
-      disabled={!runtimeBound}
-      tooltip={
-        runtimeBound ? undefined : t(($) => $.window.agent_needs_runtime_hint)
-      }
-      onClick={() => onSelect(agent)}
-    >
-      <ActorAvatar
-        actorType="agent"
-        actorId={agent.id}
-        size="md"
-        enableHoverCard
-        showStatusDot
-      />
-      <span className="truncate flex-1">{agent.name}</span>
-      {!runtimeBound && (
-        <span className="shrink-0 text-micro text-amber-600 dark:text-amber-400">
-          {t(($) => $.window.agent_needs_runtime)}
-        </span>
-      )}
-    </PickerItem>
-  );
-}
-
-interface SessionRowAction extends RowActionItem {
-  /** Extra visible text in the hover strip (the stop button reads "Stop"). */
-  stripText?: string;
 }
 
 /**
@@ -1147,7 +1090,7 @@ function SessionDropdown({
   const agentById = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
   const activeSession = sessions.find((s) => s.id === activeSessionId);
   const title = activeSession?.title?.trim() || t(($) => $.window.untitled);
-  const triggerAgent = activeSession ? agentById.get(activeSession.agent_id) ?? null : null;
+  const triggerAgent = activeSession && activeSession.agent_id ? agentById.get(activeSession.agent_id) ?? null : null;
 
   // The old soft-archive feature was removed. Pre-existing rows with
   // status='archived' are legacy dead data and are excluded from history.
@@ -1319,7 +1262,7 @@ function SessionDropdown({
 
   const renderRow = (session: ChatSession) => {
     const isCurrent = session.id === activeSessionId;
-    const agent = agentById.get(session.agent_id) ?? null;
+    const agent = session.agent_id ? agentById.get(session.agent_id) ?? null : null;
     const pendingTask = pendingTaskBySessionId.get(session.id);
     const isRunning = !!pendingTask;
     const showCompleted = completedFlashIds.has(session.id) && !isCurrent;
@@ -1336,34 +1279,6 @@ function SessionDropdown({
           ? t(($) => $.session_history.row_subtitle.new_reply)
           : formatTimeAgo(session.updated_at);
 
-    // One list drives both action surfaces — the compact menu without hover
-    // and the hover strip with it — so they cannot drift.
-    const rowActions: SessionRowAction[] = isRunning
-      ? [
-          {
-            key: "stop",
-            icon: <Square className="size-2.5 fill-current" />,
-            label: t(($) => $.session_history.row_stop_aria),
-            stripText: t(($) => $.session_history.stop_action),
-            danger: true,
-            onSelect: () => setConfirmingStopId(session.id),
-          },
-        ]
-      : [
-          {
-            key: "rename",
-            icon: <Pencil className="size-3.5" />,
-            label: t(($) => $.session_history.row_rename_aria),
-            onSelect: () => setRenamingId(session.id),
-          },
-          {
-            key: "archive",
-            icon: <Archive className="size-3.5" />,
-            label: t(($) => $.list.archive),
-            onSelect: () => handleArchive(session),
-          },
-        ];
-
     return (
       <div
         key={session.id}
@@ -1375,7 +1290,9 @@ function SessionDropdown({
         }}
         onKeyDown={(e) => {
           if (isRenaming || isConfirmingAction) return;
-          handleRowActivationKey(e, () => handleSelectSession(session));
+          if (e.key !== "Enter" && e.key !== " ") return;
+          e.preventDefault();
+          handleSelectSession(session);
         }}
         className={cn(
           "group/history-row relative flex min-h-11 min-w-0 cursor-default items-center gap-2 overflow-hidden rounded-md py-1.5 pl-2 pr-2 outline-none transition-colors hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:ring-1 focus-visible:ring-ring",
@@ -1458,7 +1375,7 @@ function SessionDropdown({
             </div>
           ) : (
             <div className="flex shrink-0 items-center">
-              <div className="flex h-7 items-center justify-end gap-1.5 text-caption text-muted-foreground [@media(hover:hover)]:group-hover/history-row:hidden [@media(hover:hover)]:group-focus-within/history-row:hidden">
+              <div className="flex h-7 items-center justify-end gap-1.5 text-caption text-muted-foreground group-hover/history-row:hidden">
                 {isRunning && <Loader2 className="size-3 animate-spin" />}
                 {showCompleted && !isRunning && <Check className="size-3 text-emerald-500" />}
                 {showUnread && !isRunning && !showCompleted && (
@@ -1470,16 +1387,9 @@ function SessionDropdown({
                 )}
                 <span className={cn("truncate", (showUnread || showCompleted || isRunning) && "font-medium text-foreground")}>{trailingStatus}</span>
               </div>
-              {/* Touch has no hover: without it the status above stays put and
-                  these same actions move into the row's compact menu. */}
-              <RowActionsMenu
-                label={t(($) => $.session_history.row_actions_aria)}
-                groups={[rowActions]}
-              />
-              <div className="hidden h-7 items-center gap-0.5 [@media(hover:hover)]:group-hover/history-row:flex [@media(hover:hover)]:group-focus-within/history-row:flex">
-                {rowActions.map((action) => (
+              <div className="hidden h-7 items-center gap-0.5 group-hover/history-row:flex">
+                {isRunning && pendingTask && (
                   <button
-                    key={action.key}
                     type="button"
                     onPointerDown={(e) => {
                       e.preventDefault();
@@ -1488,20 +1398,54 @@ function SessionDropdown({
                     onClick={(e) => {
                       e.stopPropagation();
                       e.preventDefault();
-                      action.onSelect();
+                      setConfirmingStopId(session.id);
                     }}
-                    className={
-                      action.danger
-                        ? "inline-flex h-7 items-center gap-1 rounded px-1.5 text-micro font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive focus-visible:outline-none"
-                        : "inline-flex size-7 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground focus-visible:outline-none"
-                    }
-                    aria-label={action.label}
-                    title={action.label}
+                    className="inline-flex h-7 items-center gap-1 rounded px-1.5 text-micro font-medium text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive focus-visible:outline-none"
+                    aria-label={t(($) => $.session_history.row_stop_aria)}
+                    title={t(($) => $.session_history.row_stop_aria)}
                   >
-                    {action.icon}
-                    {action.stripText}
+                    <Square className="size-2.5 fill-current" />
+                    {t(($) => $.session_history.stop_action)}
                   </button>
-                ))}
+                )}
+                {!isRunning && (
+                  <>
+                    <button
+                      type="button"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        setRenamingId(session.id);
+                      }}
+                      className="inline-flex size-7 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground focus-visible:outline-none"
+                      aria-label={t(($) => $.session_history.row_rename_aria)}
+                      title={t(($) => $.session_history.row_rename_aria)}
+                    >
+                      <Pencil className="size-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        handleArchive(session);
+                      }}
+                      className="inline-flex size-7 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:bg-accent focus-visible:text-foreground focus-visible:outline-none"
+                      aria-label={t(($) => $.list.archive)}
+                      title={t(($) => $.list.archive)}
+                    >
+                      <Archive className="size-3.5" />
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           )

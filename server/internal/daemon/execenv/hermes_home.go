@@ -47,11 +47,8 @@ import (
 //     the agent's persistent store so it survives across tasks and issues
 //     (hermes_memory.go); it is a fresh per-task dir only when no store applies;
 //   - keeps the state.db SQLite session store and its journal sidecars
-//     overlay-owned: the host's conversation history is never linked or copied.
-//     state.db is then linked to the conversation's own persistent store
-//     (hermes_sessions.go) so a multi-turn conversation survives the task; it
-//     stays a task-local file only when there is no store to key on, or on a
-//     host that cannot create the link;
+//     overlay-owned too: Hermes creates them lazily, Reuse preserves them for
+//     the task, and host conversation history is never linked or copied;
 //   - disables the external `memory.provider` in the derived config so a
 //     host-configured Supermemory/Hindsight/etc. backend isn't shared across
 //     tasks. This is the on-disk + external-backend memory isolation; a managed,
@@ -372,70 +369,51 @@ func hermesProfileDir(root, name string) (home string, mustExist bool, err error
 // silently seed from an empty dir and drop the user's auth/config. env is the
 // sanitized effective env used to expand ${VAR} in external_dirs so it matches
 // what the Hermes child sees. memoryStore is the agent's persistent memory store
-// (execenv.HermesMemoryStorePath) that memories/ is linked to; empty keeps
-// memories/ task-local for this task. sessionStore is the conversation's
-// persistent session store (execenv.HermesSessionStorePath) that state.db is
-// linked to; empty — or a host that cannot create the link — keeps the session
-// database task-local. The returned hermesSessionMount reports both what got
-// mounted and whether the store actually holds a transcript, so the caller never
-// tells a task it can resume history that is not there.
-func prepareHermesHome(hermesHome, sourceHome string, sourceMustExist bool, workspaceSkills []SkillContextForEnv, env map[string]string, memoryStore, sessionStore string, logger *slog.Logger) (sessions hermesSessionMount, err error) {
+// (execenv.HermesMemoryStorePath) that memories/ is linked to; empty keeps the
+// pre-MUL-5932 task-local dir, which is what the rollback switch produces.
+func prepareHermesHome(hermesHome, sourceHome string, sourceMustExist bool, workspaceSkills []SkillContextForEnv, env map[string]string, memoryStore string, logger *slog.Logger) error {
 	sharedHome := strings.TrimSpace(sourceHome)
 	if sharedHome == "" {
 		sharedHome = platformDefaultHermesHome()
 	}
 	if sourceMustExist {
 		if fi, err := os.Stat(sharedHome); err != nil || !fi.IsDir() {
-			return hermesSessionMount{}, fmt.Errorf("hermes profile home %q not found (create it with `hermes profile create`)", sharedHome)
+			return fmt.Errorf("hermes profile home %q not found (create it with `hermes profile create`)", sharedHome)
 		}
 	}
 
 	if err := os.MkdirAll(hermesHome, 0o700); err != nil {
-		return hermesSessionMount{}, fmt.Errorf("create hermes-home dir: %w", err)
+		return fmt.Errorf("create hermes-home dir: %w", err)
 	}
 	// Tighten perms on reuse too — MkdirAll leaves an existing dir's mode alone,
 	// and the derived config below can hold inline api_key secrets.
 	if err := os.Chmod(hermesHome, 0o700); err != nil {
-		return hermesSessionMount{}, fmt.Errorf("chmod hermes-home dir: %w", err)
+		return fmt.Errorf("chmod hermes-home dir: %w", err)
 	}
 	if err := prepareHermesTaskLocalState(hermesHome); err != nil {
-		return hermesSessionMount{}, fmt.Errorf("prepare task-local state: %w", err)
-	}
-	// Sessions: link state.db at the conversation's persistent store so the
-	// transcript survives the task. A store that cannot be mounted leaves the
-	// database task-local — the pre-existing behaviour — rather than failing the
-	// task. See hermes_sessions.go.
-	if sessionStore != "" {
-		mounted, err := mountHermesSessionDB(hermesHome, sessionStore, logger)
-		if err != nil {
-			return hermesSessionMount{}, fmt.Errorf("mount conversation sessions: %w", err)
-		}
-		sessions = mounted
+		return fmt.Errorf("prepare task-local state: %w", err)
 	}
 	// Memory: link memories/ at the agent's persistent store so it survives the
 	// task, or fall back to a fresh task-local dir when there is no store (no
-	// agent to key on, or an unresolvable profile dir). See hermes_memory.go.
+	// agent to key on, or the rollback switch is engaged). See hermes_memory.go.
 	if memoryStore != "" {
 		if err := mountHermesMemories(hermesHome, memoryStore, logger); err != nil {
-			return hermesSessionMount{}, fmt.Errorf("mount agent memories: %w", err)
+			return fmt.Errorf("mount agent memories: %w", err)
 		}
 	} else if err := detachHermesMemories(hermesHome); err != nil {
-		return hermesSessionMount{}, fmt.Errorf("create task memories dir: %w", err)
+		return fmt.Errorf("create task memories dir: %w", err)
 	}
 
 	if err := mirrorSharedHermesHome(sharedHome, hermesHome, logger); err != nil {
-		return hermesSessionMount{}, fmt.Errorf("mirror shared hermes home: %w", err)
+		return fmt.Errorf("mirror shared hermes home: %w", err)
 	}
 	if err := writeDerivedHermesConfig(sharedHome, hermesHome, env, logger); err != nil {
-		return hermesSessionMount{}, fmt.Errorf("derive hermes config: %w", err)
+		return fmt.Errorf("derive hermes config: %w", err)
 	}
 	if err := writeDerivedHermesEnv(sharedHome, hermesHome); err != nil {
-		return hermesSessionMount{}, fmt.Errorf("derive hermes .env: %w", err)
+		return fmt.Errorf("derive hermes .env: %w", err)
 	}
-	if err := writeHermesBoundSkills(hermesHome, workspaceSkills, logger); err != nil {
-		return hermesSessionMount{}, err
-	}
-	return sessions, nil
+	return writeHermesBoundSkills(hermesHome, workspaceSkills, logger)
 }
 
 // writeDerivedHermesEnv writes the task-local .env: the source home's .env

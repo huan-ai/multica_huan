@@ -11,7 +11,6 @@ import { issueKeys } from "../issues/queries";
 import { chatKeys } from "../chat/queries";
 import { workspaceWorkingAgentsKeys } from "../agents/queries";
 import { workspaceKeys } from "../workspace/queries";
-import { dingtalkKeys } from "../dingtalk/queries";
 import {
   markWorkspaceDeletePending,
   unmarkWorkspaceDeletePending,
@@ -234,22 +233,6 @@ describe("useRealtimeSync — ws instance change", () => {
 
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: issueKeys.attachments("issue-1"),
-    });
-  });
-
-  it("invalidates DingTalk group routes after a route update event", async () => {
-    const ws = createMockWs();
-    renderHook(() => useRealtimeSync(ws, stores), {
-      wrapper: createWrapper(qc),
-    });
-    const onAny = vi.mocked(ws.onAny).mock.calls[0]?.[0];
-    expect(onAny).toBeDefined();
-
-    onAny!({ type: "dingtalk_group_route:updated", payload: {} } as never);
-    await new Promise((resolve) => setTimeout(resolve, 120));
-
-    expect(invalidateSpy).toHaveBeenCalledWith({
-      queryKey: dingtalkKeys.groupRoutes("ws-1"),
     });
   });
 });

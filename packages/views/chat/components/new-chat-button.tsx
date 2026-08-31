@@ -2,8 +2,8 @@
 
 import React, { useMemo, useState } from "react";
 import { Plus } from "lucide-react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@multica/ui/components/ui/button";
-import { Tooltip, TooltipTrigger, TooltipContent } from "@multica/ui/components/ui/tooltip";
 import { ActorAvatar } from "../../common/actor-avatar";
 import {
   PickerEmpty,
@@ -12,22 +12,23 @@ import {
   PropertyPicker,
 } from "../../issues/components/pickers/property-picker";
 import { matchesPinyin } from "../../editor/extensions/pinyin-match";
-import type { Agent } from "@multica/core/types";
+import type { Agent, ChatSession, MemberWithUser } from "@multica/core/types";
 import { isAgentRuntimeBound } from "@multica/core/agents";
+import { useWorkspaceId } from "@multica/core/hooks";
+import { memberListOptions } from "@multica/core/workspace/queries";
+import { chatKeys, chatSessionsOptions } from "@multica/core/chat/queries";
+import { useCreateDirectChatSession } from "@multica/core/chat/mutations";
+import { useChatStore } from "@multica/core/chat";
+import { useAuthStore } from "@multica/core/auth";
 import { toast } from "sonner";
 import { useT } from "../../i18n";
 
-/**
- * Agent picker: a searchable, grouped (My agents / Others) list of agents in a
- * PropertyPicker. The caller supplies the trigger. `currentAgentId` marks one
- * agent with a check — omit it (as "new chat" does) when there is no current
- * selection to highlight.
- */
 export function AgentPicker({
   agents,
   userId,
   currentAgentId,
   onSelect,
+  onSelectMember,
   trigger,
   triggerRender,
   side = "bottom",
@@ -37,14 +38,29 @@ export function AgentPicker({
   userId: string | undefined;
   currentAgentId?: string;
   onSelect: (agent: Agent) => void;
+  onSelectMember?: (session: ChatSession) => void;
   trigger: React.ReactNode;
   triggerRender: React.ReactElement;
   side?: "top" | "bottom";
   align?: "start" | "center" | "end";
 }) {
   const { t } = useT("chat");
+  const wsId = useWorkspaceId();
+  const qc = useQueryClient();
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
+  const createDirectChat = useCreateDirectChatSession();
+  const setActiveSession = useChatStore((s) => s.setActiveSession);
+  const currentUserId = useAuthStore((s) => s.user?.id);
+
+  const { data: members = [] } = useQuery(memberListOptions(wsId));
+  const { data: sessions = [] } = useQuery(chatSessionsOptions(wsId));
+
+  const otherMembers = useMemo(
+    () => members.filter((m) => m.user_id !== userId),
+    [members, userId],
+  );
+
   const { mine, others } = useMemo(() => {
     const mine: Agent[] = [];
     const others: Agent[] = [];
@@ -58,13 +74,51 @@ export function AgentPicker({
   const query = filter.trim().toLowerCase();
   const matches = (name: string) =>
     !query || name.toLowerCase().includes(query) || matchesPinyin(name, query);
+
   const filteredMine = mine.filter((agent) => matches(agent.name));
   const filteredOthers = others.filter((agent) => matches(agent.name));
+  const filteredMembers = otherMembers.filter(
+    (member) => matches(member.name || member.email),
+  );
 
-  const handlePick = (agent: Agent) => {
+  const handlePickAgent = (agent: Agent) => {
     onSelect(agent);
     setOpen(false);
   };
+
+  const handlePickMember = (member: MemberWithUser) => {
+    setOpen(false);
+    // Reuse an existing active direct chat session with this member instead of
+    // always creating a new one. Match both directions: I am creator or target.
+    const existing = sessions.find(
+      (s) =>
+        s.status !== "archived" &&
+        !s.agent_id &&
+        ((s.creator_id === currentUserId && s.target_user_id === member.user_id) ||
+          (s.creator_id === member.user_id && s.target_user_id === currentUserId)),
+    );
+    if (existing) {
+      setActiveSession(existing.id);
+      onSelectMember?.(existing);
+      return;
+    }
+    createDirectChat.mutate(
+      { target_user_id: member.user_id },
+      {
+        onSuccess: (session) => {
+          qc.invalidateQueries({ queryKey: chatKeys.sessions(wsId) });
+          setActiveSession(session.id);
+          onSelectMember?.(session);
+        },
+        onError: (err) => {
+          toast.error("无法发起私聊: " + (err as Error).message);
+        },
+      },
+    );
+  };
+
+  const hasAnyItems =
+    filteredMine.length > 0 || filteredOthers.length > 0 || filteredMembers.length > 0;
 
   return (
     <PropertyPicker
@@ -79,7 +133,7 @@ export function AgentPicker({
       triggerRender={triggerRender}
       trigger={trigger}
     >
-      {filteredMine.length === 0 && filteredOthers.length === 0 ? (
+      {!hasAnyItems ? (
         <PickerEmpty />
       ) : (
         <>
@@ -90,7 +144,7 @@ export function AgentPicker({
                   key={agent.id}
                   agent={agent}
                   isCurrent={agent.id === currentAgentId}
-                  onSelect={handlePick}
+                  onSelect={handlePickAgent}
                 />
               ))}
             </PickerSection>
@@ -102,7 +156,18 @@ export function AgentPicker({
                   key={agent.id}
                   agent={agent}
                   isCurrent={agent.id === currentAgentId}
-                  onSelect={handlePick}
+                  onSelect={handlePickAgent}
+                />
+              ))}
+            </PickerSection>
+          )}
+          {filteredMembers.length > 0 && (
+            <PickerSection label="成员私聊">
+              {filteredMembers.map((member) => (
+                <MemberPickerItem
+                  key={member.user_id}
+                  member={member}
+                  onSelect={handlePickMember}
                 />
               ))}
             </PickerSection>
@@ -150,61 +215,53 @@ function AgentPickerItem({
   );
 }
 
-/**
- * "New chat" ⊕ button. Per the Chat V2 design, starting a new chat is where the
- * agent is chosen — so this opens an AgentPicker and reports the pick via
- * `onStart`. No agent is pre-checked: a new chat has no "current" agent yet.
- * Shortcuts: with a single available agent it starts immediately (no point
- * showing a one-item menu); with none it still fires `onStart(null)` so the
- * surface shows its no-agent empty state.
- */
+function MemberPickerItem({
+  member,
+  onSelect,
+}: {
+  member: MemberWithUser;
+  onSelect: (member: MemberWithUser) => void;
+}) {
+  return (
+    <PickerItem selected={false} onClick={() => onSelect(member)}>
+      <ActorAvatar
+        actorType="member"
+        actorId={member.user_id}
+        size="md"
+        showStatusDot
+      />
+      <div className="flex flex-col truncate flex-1 min-w-0">
+        <span className="truncate text-body font-medium">{member.name || member.email}</span>
+        {member.email && member.name && (
+          <span className="truncate text-caption text-muted-foreground">{member.email}</span>
+        )}
+      </div>
+    </PickerItem>
+  );
+}
+
 export function NewChatButton({
   agents,
   userId,
   onStart,
+  onSelectMember,
   side = "bottom",
 }: {
   agents: Agent[];
   userId: string | undefined;
   onStart: (agent: Agent | null) => void;
+  onSelectMember?: (session: ChatSession) => void;
   side?: "top" | "bottom";
 }) {
   const { t } = useT("chat");
   const label = t(($) => $.window.new_chat_tooltip);
-
-  if (agents.length <= 1) {
-    const only = agents[0] ?? null;
-    return (
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              className="rounded-full text-muted-foreground"
-              aria-label={label}
-              onClick={() => {
-                if (only && !isAgentRuntimeBound(only)) {
-                  toast.error(t(($) => $.input.runtime_required_toast));
-                  return;
-                }
-                onStart(only);
-              }}
-            />
-          }
-        >
-          <Plus />
-        </TooltipTrigger>
-        <TooltipContent side={side === "top" ? "top" : "bottom"}>{label}</TooltipContent>
-      </Tooltip>
-    );
-  }
 
   return (
     <AgentPicker
       agents={agents}
       userId={userId}
       onSelect={(agent) => onStart(agent)}
+      onSelectMember={onSelectMember}
       side={side}
       align="start"
       triggerRender={

@@ -20,6 +20,10 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@multica/ui/components/ui/alert-dialog";
+import { useQuery } from "@tanstack/react-query";
+import { useAuthStore } from "@multica/core/auth";
+import { useWorkspaceId } from "@multica/core/hooks";
+import { memberListOptions } from "@multica/core/workspace/queries";
 import { useWorkspacePaths } from "@multica/core/paths";
 import {
   useUpdateChatSession,
@@ -63,8 +67,22 @@ export function ChatSessionHeader({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [draft, setDraft] = useState(session.title ?? "");
   const inputRef = useRef<HTMLInputElement>(null);
-
   const title = session.title?.trim() || t(($) => $.window.untitled);
+  const user = useAuthStore((s) => s.user);
+  const wsId = useWorkspaceId();
+  const { data: members = [] } = useQuery(memberListOptions(wsId));
+
+  const otherUserId = session.target_user_id
+    ? session.creator_id === user?.id
+      ? session.target_user_id
+      : session.creator_id
+    : null;
+  const otherMember = otherUserId ? members.find((m) => m.user_id === otherUserId) : null;
+
+  const rawTitle = session.title?.trim();
+  const displayTitle = otherMember
+    ? otherMember.name || otherMember.email || "成员私聊"
+    : (rawTitle === "Direct Chat" ? "成员私聊" : rawTitle) || t(($) => $.window.untitled);
 
   useEffect(() => {
     if (editing) {
@@ -99,7 +117,9 @@ export function ChatSessionHeader({
 
   return (
     <div className="flex h-12 shrink-0 items-center gap-3 border-b px-4">
-      {agent ? (
+      {otherUserId ? (
+        <ActorAvatar actorType="member" actorId={otherUserId} size="lg" showStatusDot />
+      ) : agent ? (
         <ActorAvatar actorType="agent" actorId={agent.id} size="lg" enableHoverCard showStatusDot />
       ) : (
         <span className="size-[30px] shrink-0" />
@@ -132,15 +152,19 @@ export function ChatSessionHeader({
             title={t(($) => $.header.rename)}
             className="block max-w-full truncate text-left text-body font-semibold text-foreground outline-none hover:text-foreground/80 focus-visible:text-foreground/80"
           >
-            {title}
+            {displayTitle}
           </button>
         )}
-        {agent && (
+        {otherMember ? (
+          <div className="truncate text-caption text-muted-foreground">
+            {otherMember.email ? `${otherMember.email} · 成员私聊` : "成员私聊"}
+          </div>
+        ) : agent ? (
           <div className="truncate text-caption text-muted-foreground">
             {agent.name}
             {agent.description ? ` · ${agent.description}` : ""}
           </div>
-        )}
+        ) : null}
       </div>
 
       <DropdownMenu>

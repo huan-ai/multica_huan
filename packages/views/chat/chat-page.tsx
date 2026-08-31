@@ -211,6 +211,10 @@ export function ChatPage() {
       agents={c.availableAgents}
       userId={c.user?.id}
       onStart={startNewChat}
+      onSelectMember={(session) => {
+        setComposingNew(false);
+        c.handleSelectSession(session);
+      }}
       side="bottom"
     />
   );
@@ -317,11 +321,11 @@ export function ChatPage() {
         isRunning={!!c.pendingTaskId}
         allowSubmitWhileRunning={c.pendingTask?.supports_queue === true}
         disabled={
-          c.isSessionArchived || c.isAgentArchived || !c.isAgentRuntimeBound
+          c.isSessionArchived || (!c.isDirectChat && (c.isAgentArchived || !c.isAgentRuntimeBound))
         }
-        noAgent={c.noAgent}
-        agentArchived={c.isAgentArchived}
-        agentRuntimeRequired={!c.isAgentRuntimeBound}
+        noAgent={c.isDirectChat ? false : c.noAgent}
+        agentArchived={c.isDirectChat ? false : c.isAgentArchived}
+        agentRuntimeRequired={c.isDirectChat ? false : !c.isAgentRuntimeBound}
         agentName={c.activeAgent?.name}
         projects={c.projects}
         projectId={c.activeProjectId}

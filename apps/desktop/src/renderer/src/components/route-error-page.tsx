@@ -2,23 +2,44 @@ import { useMemo } from "react";
 import { isRouteErrorResponse, useLocation, useRouteError } from "react-router-dom";
 import { AlertTriangle, Compass, RotateCw, Send, X } from "lucide-react";
 import { Button } from "@multica/ui/components/ui/button";
-import type { DesktopRouteErrorFeedbackContext } from "@multica/core/feedback";
 import { useModalStore } from "@multica/core/modals";
 import { useTabStore } from "@/stores/tab-store";
 
-export function createRouteErrorFeedbackContext({
+type DesktopAppInfo = {
+  version?: string;
+  os?: string;
+};
+
+export function formatRouteErrorReport({
   error,
+  url,
+  appInfo,
   trigger,
 }: {
   error: unknown;
+  url: string;
+  appInfo?: DesktopAppInfo;
   trigger: string;
-}): DesktopRouteErrorFeedbackContext {
+}) {
   const normalized = normalizeError(error);
-  return {
-    kind: "desktop_route_error",
-    trigger,
-    error: normalized,
-  };
+  return [
+    "kind: desktop_route_error",
+    `trigger: ${trigger}`,
+    `url: ${url}`,
+    `app_version: ${appInfo?.version ?? "unknown"}`,
+    `runtime_os: ${appInfo?.os ?? "unknown"}`,
+    "",
+    "context:",
+    `- name: ${normalized.name}`,
+    `- message: ${normalized.message}`,
+    "",
+    "stack:",
+    "```",
+    normalized.stack ?? "<no stack>",
+    "```",
+    "",
+    "TODO: promote error context to structured feedback fields once the feedback API supports them.",
+  ].join("\n");
 }
 
 /**
@@ -107,14 +128,20 @@ function DesktopNotFoundPage() {
 }
 
 function DesktopUnexpectedErrorPage({ error }: { error: unknown }) {
+  const location = useLocation();
   const recoveryRoute = useRecoveryRoute();
-  const feedbackContext = useMemo(
+  const report = useMemo(
     () =>
-      createRouteErrorFeedbackContext({
+      formatRouteErrorReport({
         error,
+        url:
+          typeof window !== "undefined"
+            ? `${window.location.origin}${location.pathname}${location.search}${location.hash}`
+            : location.pathname,
+        appInfo: typeof window !== "undefined" ? window.desktopAPI?.appInfo : undefined,
         trigger: "route-errorElement",
       }),
-    [error],
+    [error, location.hash, location.pathname, location.search],
   );
   const message = normalizeError(error).message;
 
@@ -170,8 +197,8 @@ function DesktopUnexpectedErrorPage({ error }: { error: unknown }) {
           type="button"
           onClick={() =>
             useModalStore.getState().open("feedback", {
+              initialMessage: report,
               kind: "bug",
-              context: feedbackContext,
             })
           }
         >

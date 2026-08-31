@@ -122,7 +122,7 @@ export type ProjectContextChange =
 export function planProjectContextChange(input: {
   targetProjectId: string | null;
   activeSessionId: string | null;
-  currentSession: { id: string; agent_id: string } | null;
+  currentSession: { id: string; agent_id?: string | null } | null;
 }): ProjectContextChange {
   if (input.activeSessionId) {
     if (!input.currentSession) return { kind: "awaitSession" };
@@ -131,7 +131,7 @@ export function planProjectContextChange(input: {
     }
     return {
       kind: "startFreshChat",
-      agentId: input.currentSession.agent_id,
+      agentId: input.currentSession.agent_id ?? "",
       projectId: input.targetProjectId,
     };
   }
@@ -332,17 +332,23 @@ export function useChatController(opts?: { isActive?: boolean }) {
     : null;
   const isAgentArchived = !!sessionAgent?.archived_at;
 
+  const isDirectChat = !!currentSession?.target_user_id || (!!currentSession && !currentSession.agent_id);
+
   // Resolve selected agent: open session's agent → stored preference → first
   // available. New chats have no session, so they fall through to the picker.
-  const activeAgent =
-    sessionAgent ??
-    availableAgents.find((a) => a.id === selectedAgentId) ??
-    availableAgents[0] ??
-    null;
-  const isAgentRuntimeBound = !!activeAgent && hasAgentRuntime(activeAgent);
+  // Direct member chats explicitly set activeAgent to null so they do not fall back.
+  const activeAgent = isDirectChat
+    ? null
+    : (sessionAgent ??
+      availableAgents.find((a) => a.id === selectedAgentId) ??
+      availableAgents[0] ??
+      null);
+  const isAgentRuntimeBound = isDirectChat
+    ? true
+    : !!activeAgent && hasAgentRuntime(activeAgent);
 
   const agentAvailability = useWorkspaceAgentAvailability();
-  const noAgent = agentAvailability === "none";
+  const noAgent = isDirectChat ? false : agentAvailability === "none";
 
   const projectContextSupport = useChatProjectContextSupport(wsId, activeAgent);
 
@@ -446,7 +452,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
 
   // Upload transport moved into the coordinated-upload engine inside ChatInput
   // (MUL-5181 L2); surfaces only forward whether the affordance exists.
-  const uploadEnabled = !!activeAgent;
+  const uploadEnabled = isDirectChat || !!activeAgent;
 
   const handleSend = useCallback(
     async (
@@ -455,7 +461,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
       commitInput?: (options?: { extraDraftKeys?: string[]; clearEditor?: boolean }) => void,
       draftAttachments: Attachment[] = [],
     ): Promise<boolean> => {
-      if (!activeAgent) {
+      if (!activeAgent && !isDirectChat) {
         apiLogger.warn("sendChatMessage skipped: no active agent");
         return false;
       }
@@ -465,7 +471,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
       if (isAgentArchived) {
         apiLogger.warn("sendChatMessage skipped: agent is archived", {
           sessionId: activeSessionId,
-          agentId: activeAgent.id,
+          agentId: activeAgent?.id,
         });
         return false;
       }
@@ -486,7 +492,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
       apiLogger.info("sendChatMessage.start", {
         sessionId: activeSessionId,
         isNewSession,
-        agentId: activeAgent.id,
+        agentId: activeAgent?.id ?? "direct",
         contentLength: finalContent.length,
         attachmentCount: attachmentIds?.length ?? 0,
       });
@@ -565,14 +571,17 @@ export function useChatController(opts?: { isActive?: boolean }) {
       // arrival order, and this richer row (it carries the draft attachments)
       // is never downgraded by the echo, which has no attachments field.
       upsertChatMessageToCaches(qc, sessionId, sent, { seedIfMissing: true });
-      seedAcceptedPendingTask(qc, sessionId, {
-        task_id: result.task_id,
-        created_at: result.created_at,
-        message_id: result.message_id,
-        content: finalContent,
-        supports_queue: result.supports_queue,
-        queued: result.queued,
-      });
+      // Direct chats return empty task_id — skip pending task seeding.
+      if (result.task_id) {
+        seedAcceptedPendingTask(qc, sessionId, {
+          task_id: result.task_id,
+          created_at: result.created_at,
+          message_id: result.message_id,
+          content: finalContent,
+          supports_queue: result.supports_queue,
+          queued: result.queued,
+        });
+      }
       // Cache primed → publish the new active session, but only if the user
       // hasn't navigated away mid-send. See isStillOnComposeTarget. commitInput
       // clears the sent draft, and scrubs the shared editor only when the user
@@ -686,10 +695,10 @@ export function useChatController(opts?: { isActive?: boolean }) {
   );
 
   const handleSelectSession = useCallback(
-    (session: { id: string; agent_id: string; project_id?: string | null }) => {
+    (session: { id: string; agent_id?: string | null; project_id?: string | null }) => {
       // Sessions are bound 1:1 to an agent — picking a session from a
       // different agent implicitly switches the agent too.
-      if (activeAgent && session.agent_id !== activeAgent.id) {
+      if (session.agent_id && activeAgent && session.agent_id !== activeAgent.id) {
         uiLogger.info("selectSession (cross-agent)", {
           from: activeAgent.id,
           toAgent: session.agent_id,
@@ -752,7 +761,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
   // right agent even when the next chat belongs to a different agent. A no-op
   // when the archived session isn't the open one — that selection stays put.
   const advanceSelectionAfterArchive = useCallback(
-    (session: { id: string; agent_id: string }) => {
+    (session: { id: string; agent_id?: string | null }) => {
       if (activeSessionId !== session.id) return;
       const history = sortChatSessions(
         sessions.filter((s) => s.status !== "archived"),
@@ -789,6 +798,7 @@ export function useChatController(opts?: { isActive?: boolean }) {
       setSessionProject.isPending || (!!activeSessionId && !currentSession),
     currentSession,
     isSessionArchived,
+    isDirectChat,
     isAgentArchived,
     isAgentRuntimeBound,
     activeAgent,

@@ -126,6 +126,27 @@ export function useCreateChatSession() {
   });
 }
 
+export function useCreateDirectChatSession() {
+  const qc = useQueryClient();
+  const wsId = useWorkspaceId();
+
+  return useMutation({
+    mutationFn: (data: { target_user_id: string }) => {
+      logger.info("createDirectChatSession.start", { target_user_id: data.target_user_id });
+      return api.createDirectChatSession(data);
+    },
+    onSuccess: (session) => {
+      logger.info("createDirectChatSession.success", { sessionId: session.id });
+    },
+    onError: (err) => {
+      logger.error("createDirectChatSession.error", err);
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: chatKeys.sessions(wsId) });
+    },
+  });
+}
+
 /**
  * Clears the session's unread state server-side. Optimistically flips
  * has_unread to false in the cached list so the FAB badge drops

@@ -10,7 +10,6 @@ import (
 const (
 	SourceWorkspace = "workspace"
 	SourceBuiltin   = "builtin"
-	SourcePlugin    = "plugin"
 )
 
 type File struct {

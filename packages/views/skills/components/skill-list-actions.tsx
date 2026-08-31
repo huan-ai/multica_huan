@@ -8,7 +8,6 @@ import {
   Loader2,
   MoreHorizontal,
   Plus,
-  RotateCw,
   Search,
   Trash2,
   X,
@@ -52,8 +51,6 @@ import { ActorAvatar } from "@multica/ui/components/common/actor-avatar";
 import { cn } from "@multica/ui/lib/utils";
 import { useT } from "../../i18n";
 import { useIntentNavigate } from "../../navigation";
-import { isRefreshableOrigin, readOrigin } from "../lib/origin";
-import { RefreshSkillDialog } from "./refresh-skill-dialog";
 import type { SkillRow } from "./skills-page";
 
 // Shared context the row kebab and the batch toolbar both need. Assembled
@@ -530,11 +527,7 @@ export function SkillRowActions({
   const paths = useWorkspacePaths();
   const intentNavigate = useIntentNavigate();
   const [addOpen, setAddOpen] = useState(false);
-  const [refreshOpen, setRefreshOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
-
-  const origin = readOrigin(row.skill);
-  const canRefresh = row.canEdit && isRefreshableOrigin(origin);
 
   return (
     <span
@@ -571,12 +564,6 @@ export function SkillRowActions({
             <Plus className="size-3.5" />
             {t(($) => $.actions.add_to_agent)}
           </DropdownMenuItem>
-          {canRefresh && (
-            <DropdownMenuItem onClick={() => setRefreshOpen(true)}>
-              <RotateCw className="size-3.5" />
-              {t(($) => $.actions.refresh)}
-            </DropdownMenuItem>
-          )}
           {row.canEdit && (
             <>
               <DropdownMenuSeparator />
@@ -597,15 +584,6 @@ export function SkillRowActions({
         open={addOpen}
         onOpenChange={setAddOpen}
       />
-      {canRefresh && (
-        <RefreshSkillDialog
-          skill={row.skill}
-          origin={origin}
-          wsId={ctx.wsId}
-          open={refreshOpen}
-          onOpenChange={setRefreshOpen}
-        />
-      )}
       <DeleteSkillsDialog
         rows={[row]}
         ctx={ctx}

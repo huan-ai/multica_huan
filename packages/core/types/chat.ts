@@ -80,7 +80,8 @@ export interface ChatLastMessage {
 export interface ChatSession {
   id: string;
   workspace_id: string;
-  agent_id: string;
+  agent_id?: string | null;
+  target_user_id?: string | null;
   creator_id: string;
   /** Durable project context for every turn in this session. Null when the
    *  conversation uses workspace context only; optional for older servers. */
@@ -177,6 +178,10 @@ export interface ChatMessagesPage {
 
 export interface SendChatMessageResponse {
   message_id: string;
+  /**
+   * Empty string for direct member-to-member chats (no agent task).
+   * Consumers must guard on `task_id` being truthy before using it.
+   */
   task_id: string;
   /** True when the server supports queued follow-up sends. */
   supports_queue?: boolean;

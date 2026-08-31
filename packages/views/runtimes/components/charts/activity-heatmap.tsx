@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import type { RuntimeUsage } from "@multica/core/types";
 import { useCustomPricingStore } from "@multica/core/runtimes/custom-pricing-store";
 import { addDaysIso, estimateCost, formatUsd, todayIso, weekStartIso } from "../../utils";
-import { useLocale, useT } from "../../../i18n";
+import { useT } from "../../../i18n";
 
 // 26 weeks (~6 months) gives the heatmap real presence in the wider chart
 // card and turns "long-view" into a meaningful tab — a 13-week strip looked
@@ -12,12 +12,10 @@ const HEATMAP_WEEKS = 26;
 const CELL_SIZE = 16;
 const CELL_GAP = 3;
 // Monday-first row order, matching ISO 8601 and the rest of the Weekly
-// aggregation (see #MUL-2382). Labelling alternating rows keeps the density
-// readable without tying the chart structure to one language.
-const LABELED_WEEKDAY_INDICES = new Set([0, 2, 4]);
-// 2026-01-05 is a Monday, so walking 7 days from here lines the formatted
-// names up with the Monday-first `dayOfWeek` index.
-const WEEKDAY_ANCHOR = Date.UTC(2026, 0, 5);
+// aggregation (see #MUL-2382). Rows labelled Mon / Wed / Fri keep the
+// density readable.
+const DAY_LABELS = ["Mon", "", "Wed", "", "Fri", "", ""];
+const WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 // Cells use the brand-derived chart-1 hue with descending opacity instead
 // of a neutral foreground fade, so the heatmap reads as part of the same
@@ -30,32 +28,18 @@ function getHeatmapColor(level: number): string {
   return `color-mix(in oklch, var(--color-chart-1) ${opacities[level - 1]}, transparent)`;
 }
 
-function fmtDate(iso: string, locale: string): string {
-  return new Date(iso + "T00:00:00").toLocaleString(locale, {
+function fmtDate(iso: string): string {
+  return new Date(iso + "T00:00:00").toLocaleString("en", {
     month: "short",
     day: "numeric",
   });
 }
 
-// Row labels come from Intl rather than the locale bundle: for every locale
-// we ship, its short weekday names are exactly the strings we would hand-
-// translate, and the month labels below already resolve the same way. One
-// less set of strings to keep in sync when a locale is added.
-function fmtWeekdays(locale: string): string[] {
-  const fmt = new Intl.DateTimeFormat(locale, {
-    weekday: "short",
-    timeZone: "UTC",
-  });
-  return Array.from({ length: 7 }, (_, i) =>
-    fmt.format(new Date(WEEKDAY_ANCHOR + i * 86_400_000)),
-  );
-}
-
 interface Insights {
   busiestDay: { date: string; cost: number } | null;
-  busyDayIndex: number | null;
+  busyDayName: string | null;
   busyDayAvg: number;
-  quietDayIndex: number | null;
+  quietDayName: string | null;
   quietDayAvg: number;
   totalCost: number;
   windowDays: number;
@@ -69,8 +53,6 @@ export function ActivityHeatmap({
   tz: string;
 }) {
   const { t } = useT("runtimes");
-  const locale = useLocale();
-  const weekdayLabels = useMemo(() => fmtWeekdays(locale), [locale]);
   // Memo dep — estimateCost (called inside the body below) consults the
   // user-override store, so saving a custom rate must invalidate the cells.
   const pricings = useCustomPricingStore((s) => s.pricings);
@@ -141,7 +123,7 @@ export function ActivityHeatmap({
       const month = new Date(c.date + "T00:00:00").getMonth();
       if (month !== lastMonth && c.dayOfWeek === 0) {
         months.push({
-          label: new Date(c.date + "T00:00:00").toLocaleString(locale, {
+          label: new Date(c.date + "T00:00:00").toLocaleString("en", {
             month: "short",
           }),
           week: c.week,
@@ -168,40 +150,41 @@ export function ActivityHeatmap({
       const count = weekdayCount[i] ?? 0;
       return count > 0 ? s / count : 0;
     });
-    let busyDayIndex: number | null = null;
+    let busyDayName: string | null = null;
     let busyDayAvg = 0;
-    let quietDayIndex: number | null = null;
+    let quietDayName: string | null = null;
     let quietDayAvg = Number.POSITIVE_INFINITY;
     weekdayAvg.forEach((avg, i) => {
+      const name = WEEKDAY_NAMES[i] ?? "";
       if (avg > busyDayAvg) {
         busyDayAvg = avg;
-        busyDayIndex = i;
+        busyDayName = name;
       }
       if (avg < quietDayAvg) {
         quietDayAvg = avg;
-        quietDayIndex = i;
+        quietDayName = name;
       }
     });
     if (quietDayAvg === Number.POSITIVE_INFINITY) quietDayAvg = 0;
     // When the window has no spend at all, the busy / quiet weekday picks
     // are noise (every weekday averaged to 0). Suppress them.
     if (totalCost === 0) {
-      busyDayIndex = null;
-      quietDayIndex = null;
+      busyDayName = null;
+      quietDayName = null;
     }
 
     const insights: Insights = {
       busiestDay,
-      busyDayIndex,
+      busyDayName,
       busyDayAvg,
-      quietDayIndex,
+      quietDayName,
       quietDayAvg,
       totalCost,
       windowDays: allCells.length,
     };
 
     return { cells: cellsWithLevel, monthLabels: months, insights };
-  }, [usage, pricings, tz, locale]);
+  }, [usage, pricings, tz]);
 
   const labelWidth = 28;
   const svgWidth = labelWidth + HEATMAP_WEEKS * (CELL_SIZE + CELL_GAP);
@@ -228,8 +211,8 @@ export function ActivityHeatmap({
                 {m.label}
               </text>
             ))}
-            {weekdayLabels.map((label, i) =>
-              LABELED_WEEKDAY_INDICES.has(i) ? (
+            {DAY_LABELS.map((label, i) =>
+              label ? (
                 <text
                   key={i}
                   x={0}
@@ -252,15 +235,9 @@ export function ActivityHeatmap({
                 fill={getHeatmapColor(c.level)}
                 className="transition-colors"
               >
-                {/* The tooltip date stays ISO on purpose: it is the exact
-                    day key behind the cell, and readers compare it against
-                    the API / CLI usage rows, which are ISO too. Only the
-                    prose around it is translated. */}
                 <title>
                   {c.date}:{" "}
-                  {c.cost > 0
-                    ? `$${c.cost.toFixed(2)}`
-                    : t(($) => $.charts.heatmap_no_activity)}
+                  {c.cost > 0 ? `$${c.cost.toFixed(2)}` : "No activity"}
                 </title>
               </rect>
             ))}
@@ -279,11 +256,7 @@ export function ActivityHeatmap({
         </div>
       </div>
 
-      <InsightsRow
-        insights={insights}
-        locale={locale}
-        weekdayLabels={weekdayLabels}
-      />
+      <InsightsRow insights={insights} />
     </div>
   );
 }
@@ -291,21 +264,12 @@ export function ActivityHeatmap({
 // Horizontal stat strip beneath the heatmap. Mirrors the page-top KPI
 // hero pattern (label → big value → sub) but at smaller scale to stay
 // secondary. 4 columns on desktop, 2 on narrow screens.
-function InsightsRow({
-  insights,
-  locale,
-  weekdayLabels,
-}: {
-  insights: Insights;
-  locale: string;
-  weekdayLabels: string[];
-}) {
-  const { t } = useT("runtimes");
+function InsightsRow({ insights }: { insights: Insights }) {
   const {
     busiestDay,
-    busyDayIndex,
+    busyDayName,
     busyDayAvg,
-    quietDayIndex,
+    quietDayName,
     quietDayAvg,
     totalCost,
     windowDays,
@@ -313,32 +277,21 @@ function InsightsRow({
   return (
     <dl className="grid grid-cols-2 gap-x-4 gap-y-3 border-t pt-3 sm:grid-cols-4">
       <Insight
-        label={t(($) => $.charts.heatmap_busiest_day)}
-        value={busiestDay ? fmtDate(busiestDay.date, locale) : "—"}
+        label="Busiest day"
+        value={busiestDay ? fmtDate(busiestDay.date) : "—"}
         sub={busiestDay ? formatUsd(busiestDay.cost) : null}
       />
       <Insight
-        label={t(($) => $.charts.heatmap_most_active_weekday)}
-        value={
-          busyDayIndex === null ? "—" : (weekdayLabels[busyDayIndex] ?? "—")
-        }
-        sub={busyDayIndex !== null
-          ? t(($) => $.charts.heatmap_average, { value: formatUsd(busyDayAvg) })
-          : null}
+        label="Most active weekday"
+        value={busyDayName ?? "—"}
+        sub={busyDayName ? `avg ${formatUsd(busyDayAvg)}` : null}
       />
       <Insight
-        label={t(($) => $.charts.heatmap_quietest_weekday)}
-        value={
-          quietDayIndex === null ? "—" : (weekdayLabels[quietDayIndex] ?? "—")
-        }
-        sub={quietDayIndex !== null
-          ? t(($) => $.charts.heatmap_average, { value: formatUsd(quietDayAvg) })
-          : null}
+        label="Quietest weekday"
+        value={quietDayName ?? "—"}
+        sub={quietDayName ? `avg ${formatUsd(quietDayAvg)}` : null}
       />
-      <Insight
-        label={t(($) => $.charts.heatmap_window_total, { count: windowDays })}
-        value={formatUsd(totalCost)}
-      />
+      <Insight label={`${windowDays}-day total`} value={formatUsd(totalCost)} />
     </dl>
   );
 }

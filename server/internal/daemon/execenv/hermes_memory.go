@@ -70,17 +70,36 @@ const hermesMemoryStoreRoot = "hermes-state"
 // and the overlay home — Hermes resolves it relative to HERMES_HOME.
 const hermesMemoriesEntry = "memories"
 
+// MulticaHermesTaskMemoryEnv is the rollback switch. Anything truthy (1, true,
+// yes, on; case-insensitive) restores the pre-MUL-5932 behaviour of a fresh
+// task-local memories/ dir per task, for an operator who needs to revert without
+// waiting for a release. Everything else (including unset) keeps memory
+// agent-scoped and persistent.
+const MulticaHermesTaskMemoryEnv = "MULTICA_HERMES_TASK_MEMORY"
+
+// hermesTaskLocalMemoryForced reports whether the rollback switch is engaged.
+func hermesTaskLocalMemoryForced() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(MulticaHermesTaskMemoryEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // HermesMemoryStorePath returns the persistent memory store for (daemonProfile,
-// agentID, sourceHome), or "" when memory must stay task-local — there is no
-// agent to key on, or the Multica profile dir cannot be resolved. The daemon
-// marks the returned path in-use for the task's duration so
-// PruneHermesMemoryStores never reclaims it mid-mount.
+// agentID, sourceHome), or "" when memory must stay task-local — the rollback
+// switch is engaged, there is no agent to key on, or the Multica profile dir
+// cannot be resolved. The daemon marks the returned path in-use for the task's
+// duration so PruneHermesMemoryStores never reclaims it mid-mount.
 //
 // daemonProfile namespaces by Multica profile for free: profile dirs are already
 // disjoint, so a staging daemon's GC can never see a production daemon's stores
 // and no hashed namespace segment is needed (unlike the Codex store, which lives
 // in the shared ~/.codex).
 func HermesMemoryStorePath(daemonProfile, agentID, sourceHome string) string {
+	if hermesTaskLocalMemoryForced() {
+		return ""
+	}
 	agent := sanitizePathSegment(agentID)
 	if agent == "" {
 		return ""
@@ -139,11 +158,11 @@ func hashHermesHomePath(path string) string {
 // memory outlives the task. Idempotent across Reuse: a link already pointing at
 // the store is left alone.
 //
-// A real memories/ directory left by an older daemon (or by a task that ran
-// without a store to key on) is migrated into the store rather than discarded —
-// but only into an empty store, so an upgrade never overwrites memory the agent
-// has already accumulated. A migration that cannot complete fails the overlay
-// rather than dropping the directory it could not carry over.
+// A real memories/ directory left by an older daemon (or by a task that ran with
+// the rollback switch on) is migrated into the store rather than discarded — but
+// only into an empty store, so an upgrade never overwrites memory the agent has
+// already accumulated. A migration that cannot complete fails the overlay rather
+// than dropping the directory it could not carry over.
 func mountHermesMemories(hermesHome, storeDir string, logger *slog.Logger) error {
 	dst := filepath.Join(hermesHome, hermesMemoriesEntry)
 
@@ -225,7 +244,7 @@ func migrateHermesTaskMemories(taskDir, storeDir string, logger *slog.Logger) er
 		return nil
 	}
 
-	staging, err := newHermesStoreStaging(storeDir)
+	staging, err := newHermesMemoryStaging(storeDir)
 	if err != nil {
 		return err
 	}
@@ -238,7 +257,7 @@ func migrateHermesTaskMemories(taskDir, storeDir string, logger *slog.Logger) er
 		}
 	}
 
-	promoted, err := promoteHermesStoreStaging(staging, storeDir, hermesStorePopulated)
+	promoted, err := promoteHermesMemoryStaging(staging, storeDir)
 	if err != nil {
 		return err
 	}
@@ -250,15 +269,12 @@ func migrateHermesTaskMemories(taskDir, storeDir string, logger *slog.Logger) er
 	return nil
 }
 
-// newHermesStoreStaging creates the scratch directory a store migration copies
+// newHermesMemoryStaging creates the scratch directory the migration copies
 // into. It is a sibling of the store so the promoting rename stays within one
-// filesystem, and dot-prefixed so it is obvious it is not a store of its own.
-// Shared by the memory migration here and the session-database migration in
-// hermes_sessions.go: both delete their source once the copy reports success,
-// so both need the same all-or-nothing publish.
+// filesystem, and dot-prefixed so it is obvious it is not a profile's store.
 // MkdirTemp already creates it 0700, the same mode the store itself is created
 // with, so there is no follow-up chmod that could fail and strand it.
-func newHermesStoreStaging(storeDir string) (string, error) {
+func newHermesMemoryStaging(storeDir string) (string, error) {
 	parent := filepath.Dir(storeDir)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return "", fmt.Errorf("create hermes memory store parent %s: %w", parent, err)
@@ -270,48 +286,39 @@ func newHermesStoreStaging(storeDir string) (string, error) {
 	return staging, nil
 }
 
-// promoteHermesStoreStaging publishes a fully-copied staging dir as the store,
+// promoteHermesMemoryStaging publishes a fully-copied staging dir as the store,
 // reporting whether this caller won. The empty store dir (if any) is removed
 // first: os.Remove only succeeds on an empty directory, so a store another task
 // already populated makes this a no-op, and Windows rejects a rename onto an
 // existing directory outright.
 //
 // Losing the race is not an error — the winner's store holds the same agent's
-// state — but it has to be positively confirmed, never inferred from any
+// memory — but it has to be positively confirmed, never inferred from any
 // failure. The caller deletes the source directory whenever this returns
 // (false, nil), so a permission error, a read-only filesystem or a Windows
 // sharing violation must fail closed instead of passing for "someone else
 // published".
-//
-// published answers "did a competitor already publish real state here?" and is
-// the caller's to define, because the two stores disagree about what an
-// occupied directory looks like: any entry at all means memory, while a session
-// store can hold a zero-length database or orphan journal sidecars that carry no
-// transcript. Sharing one definition let a session migration read the store as
-// empty, copy into staging, then read it as occupied at publish time and report
-// a lost race — after which the caller deleted a source database that had never
-// been carried over.
-func promoteHermesStoreStaging(staging, storeDir string, published func(string) bool) (bool, error) {
+func promoteHermesMemoryStaging(staging, storeDir string) (bool, error) {
 	if err := os.Remove(storeDir); err != nil && !os.IsNotExist(err) {
-		if published(storeDir) {
-			return false, nil // another task published first
+		if hermesMemoryStorePopulated(storeDir) {
+			return false, nil // non-empty: another task published first
 		}
-		return false, fmt.Errorf("clear empty hermes store %s before publishing: %w", storeDir, err)
+		return false, fmt.Errorf("clear empty hermes memory store %s before publishing: %w", storeDir, err)
 	}
 	if err := os.Rename(staging, storeDir); err != nil {
-		if published(storeDir) {
+		if hermesMemoryStorePopulated(storeDir) {
 			return false, nil // lost a narrow race between the remove and the rename
 		}
-		return false, fmt.Errorf("publish hermes store %s: %w", storeDir, err)
+		return false, fmt.Errorf("publish hermes memory store %s: %w", storeDir, err)
 	}
 	return true, nil
 }
 
-// hermesStorePopulated reports whether storeDir is *confirmed* to hold
+// hermesMemoryStorePopulated reports whether storeDir is *confirmed* to hold
 // entries. Anything it cannot confirm — an unreadable directory, a path that is
 // not a directory — is false, so a caller asking "did another task publish?"
 // treats uncertainty as no.
-func hermesStorePopulated(storeDir string) bool {
+func hermesMemoryStorePopulated(storeDir string) bool {
 	entries, err := os.ReadDir(storeDir)
 	return err == nil && len(entries) > 0
 }
@@ -357,12 +364,11 @@ func copyHermesMemoryTree(src, dst string) error {
 }
 
 // detachHermesMemories gives the overlay a real, task-local memories dir. It is
-// the path taken when there is no store to key on (no agent, or an unresolvable
-// Multica profile dir), so it must actively replace a link left by a previous
-// run against the persistent store: a reused overlay still carries that link,
-// and MkdirAll would follow it and silently succeed, leaving the task writing to
-// a store the daemon no longer guards from the GC. An existing real directory is
-// kept — that is this task's own memory.
+// the rollback path (MULTICA_HERMES_TASK_MEMORY), so it must actively replace a
+// link left by a previous run against the persistent store: a reused overlay
+// still carries that link, and MkdirAll would follow it and silently succeed,
+// leaving the task writing to a store the daemon no longer guards from the GC.
+// An existing real directory is kept — that is this task's own memory.
 func detachHermesMemories(hermesHome string) error {
 	dst := filepath.Join(hermesHome, hermesMemoriesEntry)
 	if fi, err := os.Lstat(dst); err == nil {

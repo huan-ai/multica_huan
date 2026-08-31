@@ -131,8 +131,10 @@ type GetSkillByWorkspaceAndNameParams struct {
 	Name        string      `json:"name"`
 }
 
-// Used by skill import and runtime-local skill discovery to reuse a workspace
-// skill by name rather than violating UNIQUE(workspace_id, name).
+// Used by agent-template materialization to implement find-or-create: when a
+// template references a skill by name that already exists in the workspace,
+// reuse the existing skill_id rather than INSERT (which would fail the
+// UNIQUE(workspace_id, name) constraint from migration 008).
 func (q *Queries) GetSkillByWorkspaceAndName(ctx context.Context, arg GetSkillByWorkspaceAndNameParams) (Skill, error) {
 	row := q.db.QueryRow(ctx, getSkillByWorkspaceAndName, arg.WorkspaceID, arg.Name)
 	var i Skill

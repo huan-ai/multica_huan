@@ -16,6 +16,6 @@ services:
     image: multica-web:dev
     build:
       context: .
-      dockerfile: Dockerfile.web
+      dockerfile: Dockerfile.web.local
       args:
         NEXT_PUBLIC_APP_VERSION: dev

@@ -258,7 +258,6 @@ func Classify(rawError string) Reason {
 		"panic",
 		"sigsegv",
 		"process exited",
-		"start codex:",
 		"pipe has been ended",
 		"file already closed",
 		"initialize failed",

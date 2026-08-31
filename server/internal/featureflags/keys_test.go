@@ -37,10 +37,3 @@ func TestAgentSkillTogglesCompatDecisionStaysEnabled(t *testing.T) {
 		t.Fatal("agent skill toggles must stay enabled for installed v0.4.0 clients")
 	}
 }
-
-func TestPluginsV1DefaultsOff(t *testing.T) {
-	flags := EvaluateFrontendPublicFlags(context.Background(), nil)
-	if flags[PluginsV1] {
-		t.Fatal("plugins_v1 must stay disabled unless explicitly enabled")
-	}
-}

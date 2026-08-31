@@ -15,7 +15,9 @@ import {
   Trash2,
 } from "lucide-react";
 import { cn } from "@multica/ui/lib/utils";
+import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
+import { memberListOptions } from "@multica/core/workspace/queries";
 import { paths, useWorkspaceSlug } from "@multica/core/paths";
 import { useWorkspacePresenceMap } from "@multica/core/agents";
 import { api } from "@multica/core/api";
@@ -28,11 +30,6 @@ import {
 import { useChatStore } from "@multica/core/chat";
 import type { Agent, ChatSession, PendingChatTasksResponse } from "@multica/core/types";
 import { ActorAvatar } from "../../common/actor-avatar";
-import {
-  RowActionsMenu,
-  handleRowActivationKey,
-  type RowActionItem,
-} from "../../common/row-actions-menu";
 import { resolveClickIntent, useOptionalNavigation } from "../../navigation";
 import { createLogger } from "@multica/core/logger";
 import { removeChatMessageFromCaches } from "@multica/core/realtime";
@@ -201,11 +198,21 @@ export function ChatThreadList({
     });
   };
 
+  const user = useAuthStore((s) => s.user);
+  const { data: members = [] } = useQuery(memberListOptions(wsId));
+
   const renderRow = (session: ChatSession) => {
     const isCurrent = session.id === activeSessionId;
-    const agent = agentById.get(session.agent_id) ?? null;
+    const agent = session.agent_id ? agentById.get(session.agent_id) ?? null : null;
     const pendingTask = pendingTaskBySessionId.get(session.id);
     const isRunning = !!pendingTask;
+    const otherUserId = session.target_user_id
+      ? session.creator_id === user?.id
+        ? session.target_user_id
+        : session.creator_id
+      : null;
+    const otherMember = otherUserId ? members.find((m) => m.user_id === otherUserId) : null;
+
     // Only "offline" (definitively long-offline) downgrades typing → waiting.
     // Unknown/loading presence keeps the optimistic "typing…" so we never
     // suppress it just because presence data hasn't landed yet.
@@ -216,7 +223,10 @@ export function ChatThreadList({
     const isConfirmingDelete = confirmingDeleteId === session.id;
     const isConfirmingStop = confirmingStopId === session.id && !!pendingTask;
     const isConfirmingAction = isConfirmingDelete || isConfirmingStop;
-    const titleText = session.title?.trim() || t(($) => $.window.untitled);
+    const rawTitle = session.title?.trim();
+    const titleText = otherMember
+      ? (otherMember.name || otherMember.email || "成员私聊")
+      : (rawTitle === "Direct Chat" ? "成员私聊" : rawTitle) || t(($) => $.window.untitled);
     const last = session.last_message ?? null;
     const timeText = last ? formatChatTime(last.created_at) : formatChatTime(session.updated_at);
 
@@ -260,58 +270,6 @@ export function ChatThreadList({
       previewNode = <span className="block truncate text-muted-foreground">{t(($) => $.list.no_messages)}</span>;
     }
 
-    // One list drives both action surfaces — the compact menu without hover
-    // and the hover strip with it — so they cannot drift. The archived view
-    // is the only place hard-delete lives; the history view offers the
-    // reversible archive instead.
-    const rowActions: RowActionItem[] =
-      view === "archived"
-        ? [
-            {
-              key: "unarchive",
-              icon: <ArchiveRestore className="size-3.5" />,
-              label: t(($) => $.list.unarchive),
-              onSelect: () =>
-                setArchived.mutate({ sessionId: session.id, archived: false }),
-            },
-            {
-              key: "delete",
-              icon: <Trash2 className="size-3.5" />,
-              label: t(($) => $.session_history.row_delete_aria),
-              danger: true,
-              onSelect: () => setConfirmingDeleteId(session.id),
-            },
-          ]
-        : [
-            {
-              key: "pin",
-              icon: session.pinned ? (
-                <PinOff className="size-3.5" />
-              ) : (
-                <Pin className="size-3.5 -rotate-45" />
-              ),
-              label: session.pinned
-                ? t(($) => $.list.unpin)
-                : t(($) => $.list.pin),
-              onSelect: () =>
-                setPinned.mutate({ sessionId: session.id, pinned: !session.pinned }),
-            },
-            isRunning
-              ? {
-                  key: "stop",
-                  icon: <Square className="size-3 fill-current" />,
-                  label: t(($) => $.session_history.row_stop_aria),
-                  danger: true,
-                  onSelect: () => setConfirmingStopId(session.id),
-                }
-              : {
-                  key: "archive",
-                  icon: <Archive className="size-3.5" />,
-                  label: t(($) => $.list.archive),
-                  onSelect: () => onArchive(session),
-                },
-          ];
-
     return (
       <div
         key={session.id}
@@ -350,7 +308,9 @@ export function ChatThreadList({
         }}
         onKeyDown={(e) => {
           if (isConfirmingAction) return;
-          handleRowActivationKey(e, () => onSelectSession(session));
+          if (e.key !== "Enter" && e.key !== " ") return;
+          e.preventDefault();
+          onSelectSession(session);
         }}
         className={cn(
           // Fixed height so nothing (hover actions, confirm prompts) can change
@@ -362,7 +322,9 @@ export function ChatThreadList({
       >
         {/* Thin ring keeps photo + fallback avatars reading as the same circle
             (the fallback's faint bg otherwise looks smaller). */}
-        {agent ? (
+        {otherUserId ? (
+          <ActorAvatar actorType="member" actorId={otherUserId} size="lg" className="ring-1 ring-inset ring-border" />
+        ) : agent ? (
           <ActorAvatar actorType="agent" actorId={agent.id} size="lg" enableHoverCard className="ring-1 ring-inset ring-border" />
         ) : (
           <span className="size-8 shrink-0" />
@@ -429,31 +391,49 @@ export function ChatThreadList({
             </div>
         </div>
 
-        {/* Compact action menu — the touch equivalent of the hover strip
-            below, which a pointer without hover can never reach. It takes real
-            layout space (rather than overlaying the preview) and gives way to
-            the hover strip on a hover-capable pointer. */}
-        {!isConfirmingAction && (
-          <RowActionsMenu
-            label={t(($) => $.list.row_actions_aria)}
-            groups={[rowActions]}
-          />
-        )}
-
         {/* Hover actions — absolutely positioned so showing/hiding them never
-            changes the row height (which was making the list jump). Keyboard
-            focus reveals them too, so they are reachable without a mouse. */}
+            changes the row height (which was making the list jump). The archived
+            view is the only place hard-delete lives; the history view offers the
+            reversible archive instead. */}
         {!isConfirmingAction && (
-          <div className="absolute inset-y-0 right-1 hidden items-center gap-0.5 rounded-md bg-gradient-to-l from-accent from-40% to-transparent pl-10 pr-1 [@media(hover:hover)]:group-hover/row:flex [@media(hover:hover)]:group-focus-within/row:flex">
-            {rowActions.map((action) => (
-              <RowAction
-                key={action.key}
-                icon={action.icon}
-                label={action.label}
-                danger={action.danger}
-                onClick={action.onSelect}
-              />
-            ))}
+          <div className="absolute inset-y-0 right-1 hidden items-center gap-0.5 rounded-md bg-gradient-to-l from-accent from-40% to-transparent pl-10 pr-1 group-hover/row:flex">
+            {view === "archived" ? (
+              <>
+                <RowAction
+                  icon={<ArchiveRestore className="size-3.5" />}
+                  label={t(($) => $.list.unarchive)}
+                  onClick={() => setArchived.mutate({ sessionId: session.id, archived: false })}
+                />
+                <RowAction
+                  icon={<Trash2 className="size-3.5" />}
+                  label={t(($) => $.session_history.row_delete_aria)}
+                  danger
+                  onClick={() => setConfirmingDeleteId(session.id)}
+                />
+              </>
+            ) : (
+              <>
+                <RowAction
+                  icon={session.pinned ? <PinOff className="size-3.5" /> : <Pin className="size-3.5 -rotate-45" />}
+                  label={session.pinned ? t(($) => $.list.unpin) : t(($) => $.list.pin)}
+                  onClick={() => setPinned.mutate({ sessionId: session.id, pinned: !session.pinned })}
+                />
+                {isRunning ? (
+                  <RowAction
+                    icon={<Square className="size-3 fill-current" />}
+                    label={t(($) => $.session_history.row_stop_aria)}
+                    danger
+                    onClick={() => setConfirmingStopId(session.id)}
+                  />
+                ) : (
+                  <RowAction
+                    icon={<Archive className="size-3.5" />}
+                    label={t(($) => $.list.archive)}
+                    onClick={() => onArchive(session)}
+                  />
+                )}
+              </>
+            )}
           </div>
         )}
       </div>

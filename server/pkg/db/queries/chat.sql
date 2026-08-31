@@ -3,6 +3,18 @@ INSERT INTO chat_session (workspace_id, agent_id, creator_id, title, runtime_id,
 VALUES ($1, $2, $3, $4, (SELECT runtime_id FROM agent WHERE id = $2), $5, sqlc.narg('project_id'))
 RETURNING *;
 
+-- name: CreateDirectMemberChatSession :one
+INSERT INTO chat_session (workspace_id, creator_id, target_user_id, title)
+VALUES ($1, $2, $3, $4)
+RETURNING *;
+
+-- name: GetDirectMemberChatSession :one
+SELECT * FROM chat_session
+WHERE workspace_id = $1
+  AND ((creator_id = $2 AND target_user_id = $3) OR (creator_id = $3 AND target_user_id = $2))
+  AND target_user_id IS NOT NULL
+LIMIT 1;
+
 -- name: ClearChatSessionProjectByProject :exec
 -- Project references are intentionally soft (no database FK). Keep chat
 -- history while removing the context selection when a project is deleted.
@@ -54,7 +66,7 @@ WHERE cs.id = $1
 SELECT cs.*,
        (SELECT count(*) FROM chat_message m
           WHERE m.chat_session_id = cs.id
-            AND m.role = 'assistant'
+            AND ((cs.agent_id IS NOT NULL AND m.role = 'assistant') OR (cs.agent_id IS NULL AND m.sender_id IS NOT NULL AND m.sender_id != sqlc.arg(creator_id)))
             AND m.created_at > cs.last_read_at)::int AS unread_count,
        COALESCE(lm.content, '') AS last_message_content,
        COALESCE(lm.role, '') AS last_message_role,
@@ -70,7 +82,7 @@ LEFT JOIN LATERAL (
    ORDER BY m.created_at DESC
    LIMIT 1
 ) lm ON true
-WHERE cs.workspace_id = $1 AND cs.creator_id = $2 AND cs.status = 'active'
+WHERE cs.workspace_id = $1 AND (cs.creator_id = sqlc.arg(creator_id) OR cs.target_user_id = sqlc.arg(creator_id)) AND cs.status = 'active'
   AND (
     lm.created_at IS NOT NULL
     OR (
@@ -99,7 +111,7 @@ SELECT cs.*,
        CASE WHEN cs.status = 'archived' THEN 0
             ELSE (SELECT count(*) FROM chat_message m
                     WHERE m.chat_session_id = cs.id
-                      AND m.role = 'assistant'
+                      AND ((cs.agent_id IS NOT NULL AND m.role = 'assistant') OR (cs.agent_id IS NULL AND m.sender_id IS NOT NULL AND m.sender_id != sqlc.arg(creator_id)))
                       AND m.created_at > cs.last_read_at)
        END::int AS unread_count,
        COALESCE(lm.content, '') AS last_message_content,
@@ -116,7 +128,7 @@ LEFT JOIN LATERAL (
    ORDER BY m.created_at DESC
    LIMIT 1
 ) lm ON true
-WHERE cs.workspace_id = $1 AND cs.creator_id = $2
+WHERE cs.workspace_id = $1 AND (cs.creator_id = sqlc.arg(creator_id) OR cs.target_user_id = sqlc.arg(creator_id))
   AND (
     lm.created_at IS NOT NULL
     OR (
@@ -332,16 +344,6 @@ SELECT id FROM chat_session
 WHERE id = $1
 FOR UPDATE;
 
--- name: LockChatSessionForAppend :one
--- The append transaction's first lock. FOR KEY SHARE conflicts with workspace
--- or session deletion but remains compatible with normal non-key session
--- updates and task enqueueing. DingTalk then acquires its route fence, matching
--- the workspace teardown order chat_session -> dingtalk_group_route and
--- preventing a route/session lock inversion.
-SELECT id FROM chat_session
-WHERE id = $1
-FOR KEY SHARE;
-
 -- name: LockChatSessionForRuntimeBind :one
 -- Acquires an exclusive (FOR UPDATE) row lock on chat_session(id), serialising
 -- "which runtime does this session execute on" against "enqueue the next task".
@@ -450,7 +452,7 @@ WHERE id = $1;
 -- 'no_response' to mark a visible turn with no text output (MUL-4351).
 INSERT INTO chat_message (
     chat_session_id, role, content, task_id, failure_reason, elapsed_ms,
-    message_kind, quick_actions, channel_media_pending_until, channel_ingested
+    message_kind, quick_actions, channel_media_pending_until, channel_ingested, sender_id
 )
 VALUES (
     $1, $2, $3, sqlc.narg(task_id), sqlc.narg(failure_reason), sqlc.narg(elapsed_ms),
@@ -464,7 +466,8 @@ VALUES (
     -- fallback window.
     CASE WHEN sqlc.narg(channel_media_pending_secs)::float8 IS NULL THEN NULL
          ELSE now() + make_interval(secs => sqlc.narg(channel_media_pending_secs)::float8) END,
-    COALESCE(sqlc.narg(channel_ingested)::boolean, FALSE)
+    COALESCE(sqlc.narg(channel_ingested)::boolean, FALSE),
+    sqlc.narg(sender_id)
 )
 RETURNING *;
 
@@ -915,10 +918,6 @@ SELECT * FROM chat_message
 WHERE id = $1;
 
 -- name: CreateChatTask :one
--- Fenced against workspace teardown: lock_task_owner_rows (migration 284)
--- locks the owners' workspace rows in the writer's own transaction and returns
--- false once they are gone, so this statement writes no row instead of stranding
--- a task in a workspace that has just been deleted (MUL-5999).
 -- The chat sender (initiator) is a direct_human originator and accountable;
 -- attribution provenance is stamped so this path is not a NULL-source enqueue
 -- bypass (MUL-4302 §2).
@@ -928,7 +927,7 @@ INSERT INTO agent_task_queue (
     runtime_connected_apps, originator_source, trigger_evidence_kind, trigger_evidence_ref_id,
     fire_at
 )
-SELECT
+VALUES (
     $1, $2, NULL,
     CASE WHEN sqlc.narg('fire_at')::timestamptz IS NULL THEN 'queued' ELSE 'deferred' END,
     $3, $4, $5,
@@ -941,7 +940,7 @@ SELECT
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id),
     sqlc.narg('fire_at')::timestamptz
-WHERE lock_task_owner_rows($1, NULL, $2)
+)
 RETURNING *;
 
 -- name: PromoteChannelChatTasksIfMediaReady :many
@@ -1057,9 +1056,6 @@ WHERE session_id NOT IN (SELECT session_id FROM retired_sessions)
       -- text guard keeps the dead session from being replayed. This and
       -- GetLastTaskSession must move together.
       -- Keep in sync with ResumeUnsafeFailure and GetLastTaskSession.
-      -- The phrase itself lives in taskfailure.AuthMethodUnresolved, which the
-      -- daemon's in-turn fresh-session retry reads (GH #6777). This guard stays
-      -- because it is the only protection for rows an older daemon wrote.
       AND NOT (COALESCE(error, '') ILIKE '%could not resolve authentication method%')
       AND NOT (COALESCE(error, '') ~* 'must not be empty|must be non-?empty|must have non-?empty|non-?empty content|cannot be empty|should not be empty'
                AND COALESCE(error, '') ~* 'role[^a-z0-9]{0,2}assistant|assistant message|message at position|messages\.[0-9]|messages\[[0-9]')

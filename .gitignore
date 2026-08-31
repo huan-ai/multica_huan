@@ -78,3 +78,7 @@ data/
 # Python (agent tooling)
 __pycache__/
 *.pyc
+.venv/
+
+# Package managers
+.pnpm-store/

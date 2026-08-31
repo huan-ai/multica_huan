@@ -145,6 +145,111 @@ func (h *Handler) CreateChatSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, chatSessionToResponse(session))
 }
 
+type CreateDirectMemberChatSessionRequest struct {
+	TargetUserID string `json:"target_user_id"`
+}
+
+func (h *Handler) CreateDirectMemberChatSession(w http.ResponseWriter, r *http.Request) {
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	workspaceID := ctxWorkspaceID(r.Context())
+
+	var req CreateDirectMemberChatSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.TargetUserID) == "" {
+		writeError(w, http.StatusBadRequest, "target_user_id is required")
+		return
+	}
+	targetUserID, ok := parseUUIDOrBadRequest(w, strings.TrimSpace(req.TargetUserID), "target_user_id")
+	if !ok {
+		return
+	}
+	workspaceUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
+	if !ok {
+		return
+	}
+	userUUID, ok := parseUUIDOrBadRequest(w, userID, "user id")
+	if !ok {
+		return
+	}
+
+	if targetUserID == userUUID {
+		writeError(w, http.StatusBadRequest, "cannot start a direct chat with yourself")
+		return
+	}
+
+	// Verify target user is a member of the workspace.
+	_, err := h.Queries.GetMemberByUserAndWorkspace(r.Context(), db.GetMemberByUserAndWorkspaceParams{
+		WorkspaceID: workspaceUUID,
+		UserID:      targetUserID,
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "target user is not a workspace member")
+		return
+	}
+
+	// Check if a 1-on-1 session already exists between these two users.
+	existing, err := h.Queries.GetDirectMemberChatSession(r.Context(), db.GetDirectMemberChatSessionParams{
+		WorkspaceID:  workspaceUUID,
+		CreatorID:    userUUID,
+		TargetUserID: targetUserID,
+	})
+	if err == nil {
+		if existing.Status == "archived" {
+			updated, err := h.Queries.SetChatSessionArchived(r.Context(), db.SetChatSessionArchivedParams{
+				ID:       existing.ID,
+				Archived: false,
+			})
+			if err == nil {
+				existing = updated
+			}
+		}
+		writeJSON(w, http.StatusOK, chatSessionToResponse(existing))
+		return
+	}
+
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start transaction")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+
+	if _, err := qtx.LockWorkspaceForChatSessionCreate(r.Context(), workspaceUUID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to lock workspace")
+		return
+	}
+
+	session, err := qtx.CreateDirectMemberChatSession(r.Context(), db.CreateDirectMemberChatSessionParams{
+		WorkspaceID:  workspaceUUID,
+		CreatorID:    userUUID,
+		TargetUserID: pgtype.UUID{Bytes: targetUserID.Bytes, Valid: true},
+		Title:        "Direct Chat",
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create direct chat session")
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit direct chat session create")
+		return
+	}
+
+	resolvedSessionID := uuidToString(session.ID)
+	h.publishChat(protocol.EventChatSessionUpdated, workspaceID, "member", userID, resolvedSessionID, protocol.ChatSessionUpdatedPayload{
+		ChatSessionID: resolvedSessionID,
+	})
+
+	writeJSON(w, http.StatusCreated, chatSessionToResponse(session))
+}
+
 func (h *Handler) ListChatSessions(w http.ResponseWriter, r *http.Request) {
 	userID, ok := requireUserID(w, r)
 	if !ok {
@@ -185,23 +290,26 @@ func (h *Handler) ListChatSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		resp = make([]ChatSessionResponse, 0, len(rows))
 		for _, s := range rows {
-			if _, ok := allowed[uuidToString(s.AgentID)]; !ok {
-				continue
+			if s.AgentID.Valid {
+				if _, ok := allowed[uuidToString(s.AgentID)]; !ok {
+					continue
+				}
 			}
 			resp = append(resp, ChatSessionResponse{
-				ID:          uuidToString(s.ID),
-				WorkspaceID: uuidToString(s.WorkspaceID),
-				AgentID:     uuidToString(s.AgentID),
-				CreatorID:   uuidToString(s.CreatorID),
-				ProjectID:   uuidToPtr(s.ProjectID),
-				Title:       s.Title,
-				Status:      s.Status,
-				HasUnread:   s.UnreadCount > 0,
-				UnreadCount: int(s.UnreadCount),
-				LastMessage: buildChatLastMessage(s.LastMessageAt, s.LastMessageContent, s.LastMessageRole, s.LastMessageFailureReason, s.LastMessageKind),
-				Pinned:      s.PinnedAt.Valid,
-				CreatedAt:   timestampToString(s.CreatedAt),
-				UpdatedAt:   timestampToString(s.UpdatedAt),
+				ID:           uuidToString(s.ID),
+				WorkspaceID:  uuidToString(s.WorkspaceID),
+				AgentID:      uuidToPtr(s.AgentID),
+				TargetUserID: uuidToPtr(s.TargetUserID),
+				CreatorID:    uuidToString(s.CreatorID),
+				ProjectID:    uuidToPtr(s.ProjectID),
+				Title:        s.Title,
+				Status:       s.Status,
+				HasUnread:    s.UnreadCount > 0,
+				UnreadCount:  int(s.UnreadCount),
+				LastMessage:  buildChatLastMessage(s.LastMessageAt, s.LastMessageContent, s.LastMessageRole, s.LastMessageFailureReason, s.LastMessageKind),
+				Pinned:       s.PinnedAt.Valid,
+				CreatedAt:    timestampToString(s.CreatedAt),
+				UpdatedAt:    timestampToString(s.UpdatedAt),
 			})
 		}
 	} else {
@@ -215,23 +323,26 @@ func (h *Handler) ListChatSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		resp = make([]ChatSessionResponse, 0, len(rows))
 		for _, s := range rows {
-			if _, ok := allowed[uuidToString(s.AgentID)]; !ok {
-				continue
+			if s.AgentID.Valid {
+				if _, ok := allowed[uuidToString(s.AgentID)]; !ok {
+					continue
+				}
 			}
 			resp = append(resp, ChatSessionResponse{
-				ID:          uuidToString(s.ID),
-				WorkspaceID: uuidToString(s.WorkspaceID),
-				AgentID:     uuidToString(s.AgentID),
-				CreatorID:   uuidToString(s.CreatorID),
-				ProjectID:   uuidToPtr(s.ProjectID),
-				Title:       s.Title,
-				Status:      s.Status,
-				HasUnread:   s.UnreadCount > 0,
-				UnreadCount: int(s.UnreadCount),
-				LastMessage: buildChatLastMessage(s.LastMessageAt, s.LastMessageContent, s.LastMessageRole, s.LastMessageFailureReason, s.LastMessageKind),
-				Pinned:      s.PinnedAt.Valid,
-				CreatedAt:   timestampToString(s.CreatedAt),
-				UpdatedAt:   timestampToString(s.UpdatedAt),
+				ID:           uuidToString(s.ID),
+				WorkspaceID:  uuidToString(s.WorkspaceID),
+				AgentID:      uuidToPtr(s.AgentID),
+				TargetUserID: uuidToPtr(s.TargetUserID),
+				CreatorID:    uuidToString(s.CreatorID),
+				ProjectID:    uuidToPtr(s.ProjectID),
+				Title:        s.Title,
+				Status:       s.Status,
+				HasUnread:    s.UnreadCount > 0,
+				UnreadCount:  int(s.UnreadCount),
+				LastMessage:  buildChatLastMessage(s.LastMessageAt, s.LastMessageContent, s.LastMessageRole, s.LastMessageFailureReason, s.LastMessageKind),
+				Pinned:       s.PinnedAt.Valid,
+				CreatedAt:    timestampToString(s.CreatedAt),
+				UpdatedAt:    timestampToString(s.UpdatedAt),
 			})
 		}
 	}
@@ -255,6 +366,13 @@ func (h *Handler) loadChatSessionForUser(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusNotFound, "chat session not found")
 		return db.ChatSession{}, false
 	}
+	if session.TargetUserID.Valid {
+		if uuidToString(session.CreatorID) != userID && uuidToString(session.TargetUserID) != userID {
+			writeError(w, http.StatusForbidden, "not your chat session")
+			return db.ChatSession{}, false
+		}
+		return session, true
+	}
 	if uuidToString(session.CreatorID) != userID {
 		writeError(w, http.StatusForbidden, "not your chat session")
 		return db.ChatSession{}, false
@@ -271,6 +389,9 @@ func (h *Handler) gateChatSessionForUser(w http.ResponseWriter, r *http.Request,
 	session, ok := h.loadChatSessionForUser(w, r, userID, workspaceID, sessionID)
 	if !ok {
 		return db.ChatSession{}, false
+	}
+	if session.TargetUserID.Valid {
+		return session, true
 	}
 	agent, err := h.Queries.GetAgent(r.Context(), session.AgentID)
 	if err != nil {
@@ -689,9 +810,11 @@ func (h *Handler) DeleteChatSession(w http.ResponseWriter, r *http.Request) {
 	// Claim, clear, prioritize, and direct send all lock the agent before task
 	// rows. Keep delete on the same agent -> task suffix after its session lock,
 	// otherwise a builder-agent delete can deadlock with a concurrent claim.
-	if _, err := qtx.GetAgentForClaimUpdate(r.Context(), session.AgentID); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to lock chat agent")
-		return
+	if session.AgentID.Valid {
+		if _, err := qtx.GetAgentForClaimUpdate(r.Context(), session.AgentID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to lock chat agent")
+			return
+		}
 	}
 
 	cancelled, err := qtx.CancelAgentTasksByChatSession(r.Context(), session.ID)
@@ -843,6 +966,45 @@ func (h *Handler) SendChatMessage(w http.ResponseWriter, r *http.Request) {
 	// soft-archived rows from before the feature are covered by the same check.
 	if session.Status != "active" {
 		writeError(w, http.StatusBadRequest, "chat session is archived")
+		return
+	}
+
+	if session.TargetUserID.Valid {
+		userUUID, ok := parseUUIDOrBadRequest(w, userID, "user id")
+		if !ok {
+			return
+		}
+		msg, err := h.Queries.CreateChatMessage(r.Context(), db.CreateChatMessageParams{
+			ChatSessionID: session.ID,
+			Role:          "user",
+			Content:       req.Content,
+			SenderID:      pgtype.UUID{Bytes: userUUID.Bytes, Valid: true},
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to create chat message")
+			return
+		}
+		_ = h.Queries.TouchChatSession(r.Context(), session.ID)
+
+		msgResp := chatMessageToResponse(msg, nil)
+		resolvedSessionID := uuidToString(session.ID)
+
+		h.publishChat(protocol.EventChatMessage, workspaceID, "member", userID, resolvedSessionID, protocol.ChatMessagePayload{
+			ChatSessionID: resolvedSessionID,
+			MessageID:     msgResp.ID,
+			Role:          msgResp.Role,
+			Content:       msgResp.Content,
+			CreatedAt:     msgResp.CreatedAt,
+		})
+
+		// Return SendChatMessageResponse (same shape the agent flow returns) so
+		// the front-end schema parser succeeds. Direct chats have no agent task,
+		// so task_id is empty and supports_queue/queued stay false.
+		writeJSON(w, http.StatusCreated, SendChatMessageResponse{
+			MessageID: msgResp.ID,
+			TaskID:    "",
+			CreatedAt: msgResp.CreatedAt,
+		})
 		return
 	}
 
@@ -1857,13 +2019,14 @@ func (h *Handler) CancelTaskByUser(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 type ChatSessionResponse struct {
-	ID          string  `json:"id"`
-	WorkspaceID string  `json:"workspace_id"`
-	AgentID     string  `json:"agent_id"`
-	CreatorID   string  `json:"creator_id"`
-	ProjectID   *string `json:"project_id"`
-	Title       string  `json:"title"`
-	Status      string  `json:"status"`
+	ID           string           `json:"id"`
+	WorkspaceID  string           `json:"workspace_id"`
+	AgentID      *string          `json:"agent_id,omitempty"`
+	TargetUserID *string          `json:"target_user_id,omitempty"`
+	CreatorID    string           `json:"creator_id"`
+	ProjectID    *string          `json:"project_id"`
+	Title        string           `json:"title"`
+	Status       string           `json:"status"`
 	// Only populated by list endpoints — single-session fetches return 0/false/nil.
 	// HasUnread is kept as a convenience (== UnreadCount > 0) for existing consumers.
 	HasUnread   bool             `json:"has_unread"`
@@ -1933,16 +2096,17 @@ type ChatMessageResponse struct {
 
 func chatSessionToResponse(s db.ChatSession) ChatSessionResponse {
 	return ChatSessionResponse{
-		ID:          uuidToString(s.ID),
-		WorkspaceID: uuidToString(s.WorkspaceID),
-		AgentID:     uuidToString(s.AgentID),
-		CreatorID:   uuidToString(s.CreatorID),
-		ProjectID:   uuidToPtr(s.ProjectID),
-		Title:       s.Title,
-		Status:      s.Status,
-		Pinned:      s.PinnedAt.Valid,
-		CreatedAt:   timestampToString(s.CreatedAt),
-		UpdatedAt:   timestampToString(s.UpdatedAt),
+		ID:           uuidToString(s.ID),
+		WorkspaceID:  uuidToString(s.WorkspaceID),
+		AgentID:      uuidToPtr(s.AgentID),
+		TargetUserID: uuidToPtr(s.TargetUserID),
+		CreatorID:    uuidToString(s.CreatorID),
+		ProjectID:    uuidToPtr(s.ProjectID),
+		Title:        s.Title,
+		Status:       s.Status,
+		Pinned:       s.PinnedAt.Valid,
+		CreatedAt:    timestampToString(s.CreatedAt),
+		UpdatedAt:    timestampToString(s.UpdatedAt),
 	}
 }
 
