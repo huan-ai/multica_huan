@@ -285,6 +285,8 @@ export function ChatPage() {
               : undefined
           }
           quickActionsPendingMessageId={quickActionsPending?.message_id ?? null}
+          currentUserId={c.user?.id}
+          sessionHasUnread={c.isDirectChat ? (c.currentSession?.has_unread ?? false) : undefined}
         />
       ) : (
         <EmptyState agent={c.activeAgent} />

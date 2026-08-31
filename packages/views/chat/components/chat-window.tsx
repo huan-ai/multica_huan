@@ -903,6 +903,8 @@ export function ChatWindow() {
               : undefined
           }
           quickActionsPendingMessageId={quickActionsPending?.message_id ?? null}
+          currentUserId={user?.id}
+          sessionHasUnread={isDirectChat ? (currentSession?.has_unread ?? false) : undefined}
         />
       ) : (
         <EmptyState

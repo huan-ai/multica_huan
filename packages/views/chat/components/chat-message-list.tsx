@@ -86,6 +86,14 @@ interface ChatMessageListProps {
    * that reply until chat:quick_actions resolves it.
    */
   quickActionsPendingMessageId?: string | null;
+  /** The current user's id — used to determine message direction. */
+  currentUserId?: string | null;
+  /**
+   * Whether the session still has unread messages (the other party hasn't
+   * read the latest user message yet). Used to render the read receipt on
+   * the last outgoing message. Omit/undefined to hide the receipt.
+   */
+  sessionHasUnread?: boolean;
 }
 
 // ─── Virtuoso chrome ─────────────────────────────────────────────────────
@@ -182,6 +190,8 @@ export function ChatMessageList({
   quickActionsDisabled = false,
   onRegenerateQuickActions,
   quickActionsPendingMessageId = null,
+  currentUserId,
+  sessionHasUnread,
 }: ChatMessageListProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollContainerEl, setScrollContainerEl] = useState<HTMLDivElement | null>(null);
@@ -203,6 +213,15 @@ export function ChatMessageList({
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (m && m.role === "assistant" && m.task_id) return m.id;
+    }
+    return null;
+  }, [messages]);
+
+  // The last user message in the list — used to anchor the read receipt.
+  const lastUserMessageId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m && m.role === "user") return m.id;
     }
     return null;
   }, [messages]);
@@ -351,6 +370,8 @@ export function ChatMessageList({
               latestAssistantMessageId={latestAssistantMessageId}
               quickActionsPendingMessageId={quickActionsPendingMessageId}
               starterCardsMessageId={starterCardsMessageId}
+              lastUserMessageId={lastUserMessageId}
+              sessionHasUnread={sessionHasUnread}
             />
           </div>
         )}
@@ -416,6 +437,8 @@ const MessageBubble = memo(function MessageBubble({
   latestAssistantMessageId,
   quickActionsPendingMessageId,
   starterCardsMessageId,
+  lastUserMessageId,
+  sessionHasUnread,
 }: {
   item: ChatRenderItem;
   isPending: boolean;
@@ -426,6 +449,8 @@ const MessageBubble = memo(function MessageBubble({
   latestAssistantMessageId: string | null;
   quickActionsPendingMessageId: string | null;
   starterCardsMessageId: string | null;
+  lastUserMessageId: string | null;
+  sessionHasUnread: boolean | undefined;
 }) {
   // The live row and the persisted assistant row both land here under one key,
   // and both render <AssistantMessage> — same component type, same position —
@@ -445,8 +470,9 @@ const MessageBubble = memo(function MessageBubble({
   const { message } = item;
 
   if (message.role === "user") {
+    const isLast = message.id === lastUserMessageId;
     return (
-      <div className="flex justify-end">
+      <div className="flex flex-col items-end gap-1">
         <div className="rounded-2xl bg-muted px-3.5 py-2 text-body max-w-[80%] break-words">
           {/* User messages are authored as markdown in ContentEditor, so they
            * render through the SAME RichContent as assistant replies and as
@@ -465,6 +491,11 @@ const MessageBubble = memo(function MessageBubble({
             className="mt-1.5"
           />
         </div>
+        <UserMessageMeta
+          createdAt={message.created_at}
+          isLast={isLast}
+          sessionHasUnread={sessionHasUnread}
+        />
       </div>
     );
   }
@@ -827,7 +858,7 @@ function MessageFooter({
   // "Finished in Xs" instead of "Replied in Xs" (MUL-4351).
   const isNoResponse = message.message_kind === "no_response";
   const showCopy = !isPending && !isNoResponse;
-  if (message.elapsed_ms == null && !showCopy) return null;
+  if (message.elapsed_ms == null && !showCopy && !message.created_at) return null;
   return (
     <div className="flex items-center gap-1.5">
       {message.elapsed_ms != null && (
@@ -836,9 +867,76 @@ function MessageFooter({
           elapsedMs={message.elapsed_ms}
         />
       )}
+      {message.created_at && (
+        <MessageTimestamp createdAt={message.created_at} />
+      )}
       {showCopy && <MessageCopyButton message={message} timeline={timeline} />}
     </div>
   );
+}
+
+// Small timestamp shown beneath a user message bubble (right-aligned)
+// and in the assistant message footer.
+function MessageTimestamp({ createdAt }: { createdAt: string }) {
+  const formatted = formatMessageTime(createdAt);
+  return (
+    <span className="text-caption text-muted-foreground/70 select-none">
+      {formatted}
+    </span>
+  );
+}
+
+// Read receipt + timestamp row under the last outgoing user message.
+// Shows "✓✓ 已读" when the session has no unread (the other party has
+// seen it) and "✓ 已发送" while unread is still pending.
+// When `sessionHasUnread` is undefined (not a direct-member chat or no
+// data yet), only the timestamp is shown.
+function UserMessageMeta({
+  createdAt,
+  isLast,
+  sessionHasUnread,
+}: {
+  createdAt: string;
+  isLast: boolean;
+  sessionHasUnread: boolean | undefined;
+}) {
+  const { t } = useT("chat");
+  const formatted = formatMessageTime(createdAt);
+  const showReceipt = isLast && sessionHasUnread !== undefined;
+  return (
+    <div className="flex items-center gap-1 text-caption text-muted-foreground/70 select-none">
+      <span>{formatted}</span>
+      {showReceipt && (
+        <span className="flex items-center gap-0.5">
+          {sessionHasUnread ? (
+            // Sent but not yet read
+            <span title={t(($) => $.message_list.sent)}>✓</span>
+          ) : (
+            // Read
+            <span className="text-primary/70" title={t(($) => $.message_list.read)}>✓✓</span>
+          )}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// Format a UTC ISO timestamp into a compact local time string.
+// Shows HH:MM for today, and MM-DD HH:MM for older messages.
+function formatMessageTime(createdAt: string): string {
+  const date = new Date(createdAt);
+  if (isNaN(date.getTime())) return "";
+  const now = new Date();
+  const isToday =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  if (isToday) return `${hh}:${mm}`;
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${month}-${day} ${hh}:${mm}`;
 }
 
 function MessageCopyButton({

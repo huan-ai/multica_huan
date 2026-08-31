@@ -80,7 +80,9 @@
     "loading_older": "Loading older messages…",
     "quick_actions_heading": "Follow-up questions",
     "quick_actions_regenerate": "Regenerate suggestions",
-    "quick_actions_regenerate_failed": "Couldn't refresh suggestions. Please try again."
+    "quick_actions_regenerate_failed": "Couldn't refresh suggestions. Please try again.",
+    "sent": "Sent",
+    "read": "Read"
   },
   "session_history": {
     "untitled": "Untitled",
