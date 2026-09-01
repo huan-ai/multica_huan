@@ -162,6 +162,14 @@ export interface ChatMessage {
   message_kind?: ChatMessageKind;
   /** Up to three server-validated follow-ups generated with this reply. */
   quick_actions?: ChatQuickAction[];
+  /**
+   * The user id of the member who authored this message. Set for user-role
+   * messages in direct member chats; absent on assistant messages and on
+   * older servers. Use this (not just `role`) to distinguish "my message"
+   * from "other party's message" in direct chats where both sides have
+   * role="user".
+   */
+  sender_id?: string | null;
 }
 
 export interface ChatMessagesCursor {

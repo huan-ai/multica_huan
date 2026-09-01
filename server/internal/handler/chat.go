@@ -2092,6 +2092,10 @@ type ChatMessageResponse struct {
 	// agent can `multica attachment download <id>` rather than guessing
 	// from a markdown URL that may expire.
 	Attachments []AttachmentResponse `json:"attachments,omitempty"`
+	// SenderID is the user id of the member who sent this message.
+	// Set for user-role messages in direct member chats; null for assistant
+	// messages and legacy rows predating the field.
+	SenderID *string `json:"sender_id,omitempty"`
 }
 
 func chatSessionToResponse(s db.ChatSession) ChatSessionResponse {
@@ -2123,6 +2127,7 @@ func chatMessageToResponse(m db.ChatMessage, attachments []AttachmentResponse) C
 		MessageKind:   normalizeMessageKind(m.MessageKind),
 		QuickActions:  decodeChatQuickActions(m.QuickActions),
 		Attachments:   attachments,
+		SenderID:      uuidToPtr(m.SenderID),
 	}
 }
 

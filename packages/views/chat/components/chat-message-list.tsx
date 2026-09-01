@@ -217,14 +217,22 @@ export function ChatMessageList({
     return null;
   }, [messages]);
 
-  // The last user message in the list — used to anchor the read receipt.
+  // The last message sent by the current user — anchors the read receipt.
+  // In direct member chats, match on sender_id so we only flag OUR last
+  // message, not the other party's. Fall back to role="user" for agent chats
+  // where sender_id is absent and only the current user sends user-role rows.
   const lastUserMessageId = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
-      if (m && m.role === "user") return m.id;
+      if (!m || m.role !== "user") continue;
+      if (currentUserId && m.sender_id) {
+        if (m.sender_id === currentUserId) return m.id;
+      } else if (m.role === "user") {
+        return m.id;
+      }
     }
     return null;
-  }, [messages]);
+  }, [messages, currentUserId]);
 
   // Mika's onboarding opening self-describes (message_kind stamped by the
   // completion path — the hidden kickoff row never reaches clients) and
@@ -372,6 +380,7 @@ export function ChatMessageList({
               starterCardsMessageId={starterCardsMessageId}
               lastUserMessageId={lastUserMessageId}
               sessionHasUnread={sessionHasUnread}
+              currentUserId={currentUserId}
             />
           </div>
         )}
@@ -439,6 +448,7 @@ const MessageBubble = memo(function MessageBubble({
   starterCardsMessageId,
   lastUserMessageId,
   sessionHasUnread,
+  currentUserId,
 }: {
   item: ChatRenderItem;
   isPending: boolean;
@@ -451,6 +461,7 @@ const MessageBubble = memo(function MessageBubble({
   starterCardsMessageId: string | null;
   lastUserMessageId: string | null;
   sessionHasUnread: boolean | undefined;
+  currentUserId: string | null | undefined;
 }) {
   // The live row and the persisted assistant row both land here under one key,
   // and both render <AssistantMessage> — same component type, same position —
@@ -471,32 +482,64 @@ const MessageBubble = memo(function MessageBubble({
 
   if (message.role === "user") {
     const isLast = message.id === lastUserMessageId;
-    return (
-      <div className="flex justify-end">
-        <div className="flex flex-col items-end gap-1 max-w-[80%]">
-          <div className="rounded-2xl bg-muted px-3.5 py-2 text-body break-words w-full">
-            {/* User messages are authored as markdown in ContentEditor, so they
-             * render through the SAME RichContent as assistant replies and as
-             * Issue/Comment — a Mermaid fence a user pastes is a diagram here
-             * too. `compact` trims the leading/trailing block margins so a
-             * single-line bubble stays as tight as the plain-text version. */}
-            <RichContent
-              content={message.content}
-              attachments={message.attachments}
-              density="compact"
-              phase="settled"
-            />
-            <AttachmentList
-              attachments={message.attachments}
-              content={message.content}
-              className="mt-1.5"
+    // In direct member-to-member chats both parties have role="user".
+    // Use sender_id when available; fall back to role="user" (agent chats
+    // where only the current user sends user-role messages).
+    const isMine = message.sender_id
+      ? message.sender_id === currentUserId
+      : true;
+
+    if (isMine) {
+      return (
+        <div className="flex justify-end">
+          <div className="flex flex-col items-end gap-1 max-w-[80%]">
+            <div className="rounded-2xl bg-muted px-3.5 py-2 text-body break-words w-full">
+              {/* User messages are authored as markdown in ContentEditor, so they
+               * render through the SAME RichContent as assistant replies and as
+               * Issue/Comment — a Mermaid fence a user pastes is a diagram here
+               * too. `compact` trims the leading/trailing block margins so a
+               * single-line bubble stays as tight as the plain-text version. */}
+              <RichContent
+                content={message.content}
+                attachments={message.attachments}
+                density="compact"
+                phase="settled"
+              />
+              <AttachmentList
+                attachments={message.attachments}
+                content={message.content}
+                className="mt-1.5"
+              />
+            </div>
+            <UserMessageMeta
+              createdAt={message.created_at}
+              isLast={isLast}
+              sessionHasUnread={sessionHasUnread}
             />
           </div>
-          <UserMessageMeta
-            createdAt={message.created_at}
-            isLast={isLast}
-            sessionHasUnread={sessionHasUnread}
+        </div>
+      );
+    }
+
+    // Other party's message in a direct member chat — left-aligned, same
+    // visual style as assistant messages but without the timeline chrome.
+    return (
+      <div className="w-full space-y-1.5">
+        <div className="rounded-2xl bg-accent px-3.5 py-2 text-body break-words max-w-[80%]">
+          <RichContent
+            content={message.content}
+            attachments={message.attachments}
+            density="compact"
+            phase="settled"
           />
+          <AttachmentList
+            attachments={message.attachments}
+            content={message.content}
+            className="mt-1.5"
+          />
+        </div>
+        <div className="text-caption text-muted-foreground/70 select-none">
+          <MessageTimestamp createdAt={message.created_at} />
         </div>
       </div>
     );

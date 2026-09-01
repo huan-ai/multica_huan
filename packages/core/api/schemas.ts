@@ -493,6 +493,9 @@ export const ChatMessageSchema = z.object({
   // Optional additive data degrades independently: a malformed suggestion
   // must not hide the assistant reply that contains it.
   quick_actions: z.array(ChatQuickActionSchema).catch([]).optional().default([]),
+  // Present on user-role messages in direct member chats. Absent on assistant
+  // messages and on legacy rows predating the field.
+  sender_id: z.string().nullable().optional(),
 }).loose();
 
 export const ChatMessageListSchema = z.array(ChatMessageSchema).default([]);
