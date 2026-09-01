@@ -521,11 +521,11 @@ const MessageBubble = memo(function MessageBubble({
       );
     }
 
-    // Other party's message in a direct member chat — left-aligned, same
-    // visual style as assistant messages but without the timeline chrome.
+    // Other party's message in a direct member chat — left-aligned, shrinks
+    // to content width (inline-block) just like the sent-message bubble.
     return (
-      <div className="w-full space-y-1.5">
-        <div className="rounded-2xl bg-accent px-3.5 py-2 text-body break-words max-w-[80%]">
+      <div className="flex flex-col items-start gap-1">
+        <div className="rounded-2xl bg-accent px-3.5 py-2 text-body break-words max-w-[80%] w-fit">
           <RichContent
             content={message.content}
             attachments={message.attachments}
