@@ -3066,6 +3066,15 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// DDD flow enforcement: check status transition rules before persisting.
+	if req.Status != nil && *req.Status != prevIssue.Status {
+		check := h.CheckDDDFlowStatusTransition(r.Context(), prevIssue, *req.Status)
+		if check.Blocked {
+			writeError(w, http.StatusConflict, check.Reason)
+			return
+		}
+	}
+
 	var issue db.Issue
 	if req.Description != nil {
 		var lockedPrev db.Issue

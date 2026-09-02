@@ -987,6 +987,33 @@ export class ApiClient {
     await this.fetch(`/api/issues/${id}`, { method: "DELETE" });
   }
 
+  async submitDDDReview(
+    issueId: string,
+    data: { decision: string; comment?: string },
+  ): Promise<{
+    decision: string;
+    comment: string;
+    reviewer_id: string;
+    reviewer_type: string;
+    reviewed_at: string;
+  }> {
+    return this.fetch(`/api/issues/${issueId}/ddd-review`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async getDDDReview(issueId: string): Promise<{
+    decision: string;
+    comment: string;
+    reviewer_id: string;
+    reviewer_type: string;
+    reviewed_at: string;
+    has_review: boolean;
+  }> {
+    return this.fetch(`/api/issues/${issueId}/ddd-review`);
+  }
+
   async batchUpdateIssues(issueIds: string[], updates: UpdateIssueRequest): Promise<{ updated: number }> {
     return this.fetch("/api/issues/batch-update", {
       method: "POST",

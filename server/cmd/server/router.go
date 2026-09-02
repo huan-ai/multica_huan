@@ -1365,6 +1365,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/attachments", h.ListAttachments)
 					r.Get("/children", h.ListChildIssues)
 					r.Get("/labels", h.ListLabelsForIssue)
+
+					// DDD review decision
+					r.Post("/ddd-review", h.SubmitDDDReview)
+					r.Get("/ddd-review", h.GetDDDReview)
 					r.Post("/labels", h.AttachLabel)
 					r.Delete("/labels/{labelId}", h.DetachLabel)
 					r.Get("/metadata", h.ListIssueMetadata)
@@ -1373,6 +1377,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Put("/properties/{propertyId}", h.SetIssueProperty)
 					r.Delete("/properties/{propertyId}", h.DeleteIssueProperty)
 					r.Get("/pull-requests", h.ListPullRequestsForIssue)
+				})
+			})
+
+			// DDD flow management
+			r.Route("/api/ddd-flows", func(r chi.Router) {
+				r.Post("/", h.InitDDDFlow)
+				r.Route("/{issueId}", func(r chi.Router) {
+					r.Get("/", h.GetDDDFlow)
+					r.Post("/expand", h.ExpandDDDFlow)
+					r.Get("/stages/{stage}/review-status", h.ReviewStageStatus)
 				})
 			})
 
