@@ -414,6 +414,64 @@ func buildInvitationParams(from, to, inviterName, workspaceName, inviteURL strin
 	}
 }
 
+// MentionNotification holds the fields needed to render a mention notification email.
+type MentionNotification struct {
+	To              string // recipient email
+	MentionerName   string // who @mentioned them
+	IssueTitle      string // issue title
+	IssueIdentifier string // e.g. "WS-14"
+	IssueID         string // issue UUID for deep link
+	WorkspaceSlug   string // workspace slug for deep link
+}
+
+// SendMentionNotificationEmail sends an email when a user is @mentioned on an issue.
+func (s *EmailService) SendMentionNotificationEmail(n MentionNotification) error {
+	appURL := strings.TrimSpace(os.Getenv("MULTICA_APP_URL"))
+	if appURL == "" {
+		appURL = strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN"))
+	}
+	if appURL == "" {
+		appURL = "https://multica.ai"
+	}
+	appURL = strings.TrimRight(appURL, "/")
+
+	issueURL := fmt.Sprintf("%s/%s/issues/%s", appURL, n.WorkspaceSlug, n.IssueID)
+	safeMentioner := html.EscapeString(n.MentionerName)
+	safeTitle := html.EscapeString(n.IssueTitle)
+	safeIdentifier := html.EscapeString(n.IssueIdentifier)
+
+	subject := fmt.Sprintf("[Multica] %s mentioned you on %s",
+		sanitizeSubjectField(n.MentionerName),
+		sanitizeSubjectField(n.IssueIdentifier+" "+n.IssueTitle))
+
+	body := fmt.Sprintf(
+		`<div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
+			<h2>You were mentioned</h2>
+			<p><strong>%s</strong> mentioned you on <strong>%s %s</strong>.</p>
+			<p style="margin: 24px 0;">
+				<a href="%s" style="display: inline-block; padding: 12px 24px; background: #000; color: #fff; text-decoration: none; border-radius: 6px; font-weight: 500;">View issue</a>
+			</p>
+			<p style="color: #666; font-size: 14px;">You received this email because you were @mentioned in Multica. Manage notification settings in your workspace preferences.</p>
+		</div>`, safeMentioner, safeIdentifier, safeTitle, issueURL)
+
+	if s.smtpHost != "" {
+		return s.sendSMTP(n.To, subject, body)
+	}
+	if s.client == nil {
+		fmt.Printf("[DEV] Mention notification to %s: %s mentioned you on %s %s — %s\n",
+			n.To, n.MentionerName, n.IssueIdentifier, n.IssueTitle, issueURL)
+		return nil
+	}
+	params := &resend.SendEmailRequest{
+		From:    s.fromEmail,
+		To:      []string{n.To},
+		Subject: subject,
+		Html:    body,
+	}
+	_, err := s.client.Emails.Send(params)
+	return err
+}
+
 // sanitizeSubjectField prepares user-controlled text for the email Subject line.
 // Subject is not HTML-rendered, so HTML-escaping would leak literal entities
 // (e.g. &lt;script&gt;) into the recipient's inbox. Instead strip control

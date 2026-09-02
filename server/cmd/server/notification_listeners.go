@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strconv"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -503,12 +505,15 @@ func notifyDirect(
 // notifyMentionedMembers creates inbox items for each @mentioned member,
 // excluding the actor and any IDs in the skip set. When an @all mention is
 // present, all workspace members are notified (excluding agents).
+// If emailSvc is non-nil, an email notification is also sent to each recipient.
 func notifyMentionedMembers(
 	bus *events.Bus,
 	queries *db.Queries,
+	emailSvc *service.EmailService,
 	e events.Event,
 	mentions []mention,
 	issueID string,
+	issueIdentifier string,
 	issueTitle string,
 	issueStatus string,
 	title string,
@@ -574,6 +579,9 @@ func notifyMentionedMembers(
 	}
 	mentionPrefs := loadUserPrefs(context.Background(), queries, e.WorkspaceID, mentionUserIDs)
 
+	// Track which user IDs were actually notified so we can send emails.
+	var notifiedUserIDs []string
+
 	for id := range recipientIDs {
 		if id == e.ActorID || skip[id] {
 			continue
@@ -600,6 +608,7 @@ func notifyMentionedMembers(
 			slog.Error("mention inbox creation failed", "mentioned_id", id, "error", err)
 			continue
 		}
+		notifiedUserIDs = append(notifiedUserIDs, id)
 		resp := inboxItemToResponse(item)
 		resp["issue_status"] = issueStatus
 		bus.Publish(events.Event{
@@ -610,16 +619,93 @@ func notifyMentionedMembers(
 			Payload:     map[string]any{"item": resp},
 		})
 	}
+
+	// Send email notifications to mentioned members.
+	if emailSvc == nil || len(notifiedUserIDs) == 0 {
+		return
+	}
+	sendMentionEmails(queries, emailSvc, e, notifiedUserIDs, issueID, issueIdentifier, issueTitle)
+}
+
+// sendMentionEmails sends email notifications to the given user IDs for a mention event.
+func sendMentionEmails(
+	queries *db.Queries,
+	emailSvc *service.EmailService,
+	e events.Event,
+	userIDs []string,
+	issueID string,
+	issueIdentifier string,
+	issueTitle string,
+) {
+	ctx := context.Background()
+
+	// Look up workspace slug for deep links.
+	ws, err := queries.GetWorkspace(ctx, parseUUID(e.WorkspaceID))
+	if err != nil {
+		slog.Error("mention email: failed to get workspace", "workspace_id", e.WorkspaceID, "error", err)
+		return
+	}
+
+	// Compute issue identifier if not provided by the caller (e.g. comment events).
+	if issueIdentifier == "" {
+		issue, err := queries.GetIssue(ctx, parseUUID(issueID))
+		if err != nil {
+			slog.Error("mention email: failed to get issue", "issue_id", issueID, "error", err)
+			return
+		}
+		issueIdentifier = ws.IssuePrefix + "-" + strconv.Itoa(int(issue.Number))
+	}
+
+	// Resolve actor name for the email subject/body.
+	actorName := "Someone"
+	if e.ActorID != "" {
+		actorUUIDs := []pgtype.UUID{parseUUID(e.ActorID)}
+		actors, err := queries.GetUsersByIDs(ctx, actorUUIDs)
+		if err == nil && len(actors) > 0 {
+			actorName = actors[0].Name
+		}
+	}
+
+	// Batch-load recipient emails.
+	uuids := make([]pgtype.UUID, len(userIDs))
+	for i, id := range userIDs {
+		uuids[i] = parseUUID(id)
+	}
+	users, err := queries.GetUsersByIDs(ctx, uuids)
+	if err != nil {
+		slog.Error("mention email: failed to get users", "error", err)
+		return
+	}
+
+	for _, u := range users {
+		if u.Email == "" {
+			continue
+		}
+		if err := emailSvc.SendMentionNotificationEmail(service.MentionNotification{
+			To:              u.Email,
+			MentionerName:   actorName,
+			IssueTitle:      issueTitle,
+			IssueIdentifier: issueIdentifier,
+			IssueID:         issueID,
+			WorkspaceSlug:   ws.Slug,
+		}); err != nil {
+			slog.Error("mention email: send failed",
+				"to", u.Email, "issue_id", issueID, "error", err)
+		}
+	}
 }
 
 // registerNotificationListeners wires up event bus listeners that create inbox
 // notifications using the subscriber table. This replaces the old hardcoded
 // notification logic from inbox_listeners.go.
 //
+// When emailSvc is non-nil, @mention notifications also send an email to the
+// mentioned member.
+//
 // NOTE: uses context.Background() because the event bus dispatches synchronously
 // within the HTTP request goroutine. Adding per-handler timeouts is a bus-level
 // concern — see events.Bus for future improvements.
-func registerNotificationListeners(bus *events.Bus, queries *db.Queries) {
+func registerNotificationListeners(bus *events.Bus, queries *db.Queries, emailSvc *service.EmailService) {
 	ctx := context.Background()
 
 	// issue:created — Direct notification to assignee if assignee != actor
@@ -652,7 +738,7 @@ func registerNotificationListeners(bus *events.Bus, queries *db.Queries) {
 		// Notify @mentions in description
 		if issue.Description != nil && *issue.Description != "" {
 			mentions := parseMentions(*issue.Description)
-			notifyMentionedMembers(bus, queries, e, mentions, issue.ID, issue.Title, issue.Status,
+			notifyMentionedMembers(bus, queries, emailSvc, e, mentions, issue.ID, issue.Identifier, issue.Title, issue.Status,
 				issue.Title, skip, emptyDetails)
 		}
 	})
@@ -827,7 +913,7 @@ func registerNotificationListeners(bus *events.Bus, queries *db.Queries) {
 					}
 				}
 				skip := map[string]bool{e.ActorID: true}
-				notifyMentionedMembers(bus, queries, e, added, issue.ID, issue.Title, issue.Status,
+				notifyMentionedMembers(bus, queries, emailSvc, e, added, issue.ID, issue.Identifier, issue.Title, issue.Status,
 					issue.Title, skip, emptyDetails)
 			}
 		}
@@ -890,7 +976,7 @@ func registerNotificationListeners(bus *events.Bus, queries *db.Queries) {
 		mentions := parseMentions(commentContent)
 		if len(mentions) > 0 {
 			skip := map[string]bool{e.ActorID: true}
-			notifyMentionedMembers(bus, queries, e, mentions, issueID, issueTitle, issueStatus,
+			notifyMentionedMembers(bus, queries, emailSvc, e, mentions, issueID, "", issueTitle, issueStatus,
 				issueTitle, skip, commentDetails)
 		}
 	})

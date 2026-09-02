@@ -728,3 +728,272 @@ func TestSendSMTP_LoginAuthRejectsUnencryptedRemote(t *testing.T) {
 		t.Errorf("expected 'unencrypted connection' error, got: %v", err)
 	}
 }
+
+// --- SendMentionNotificationEmail tests ---
+
+func TestSendMentionNotificationEmail_DEVMode_PrintsToStdout(t *testing.T) {
+	t.Setenv("MULTICA_APP_URL", "https://app.multica.ai")
+	s := &EmailService{}
+	err := s.SendMentionNotificationEmail(MentionNotification{
+		To:              "alice@example.com",
+		MentionerName:   "Bob",
+		IssueTitle:      "Fix login bug",
+		IssueIdentifier: "WS-42",
+		IssueID:         "abc-123",
+		WorkspaceSlug:   "acme",
+	})
+	if err != nil {
+		t.Fatalf("DEV mode should not return error, got: %v", err)
+	}
+}
+
+func TestSendMentionNotificationEmail_SubjectSanitization(t *testing.T) {
+	tests := []struct {
+		name       string
+		mentioner  string
+		identifier string
+		title      string
+	}{
+		{
+			name:       "control characters in mentioner name",
+			mentioner:  "Evil\r\nBcc: hacker@evil.com",
+			identifier: "WS-1",
+			title:      "Normal",
+		},
+		{
+			name:       "tabs in title",
+			mentioner:  "Alice",
+			identifier: "WS-1",
+			title:      "Fix\t\tBug",
+		},
+		{
+			name:       "long mentioner name truncated",
+			mentioner:  strings.Repeat("A", 200),
+			identifier: "WS-1",
+			title:      "Title",
+		},
+		{
+			name:       "long title truncated",
+			mentioner:  "Alice",
+			identifier: "WS-1",
+			title:      strings.Repeat("B", 200),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("MULTICA_APP_URL", "https://app.multica.ai")
+			s := &EmailService{}
+			err := s.SendMentionNotificationEmail(MentionNotification{
+				To:              "user@example.com",
+				MentionerName:   tt.mentioner,
+				IssueTitle:      tt.title,
+				IssueIdentifier: tt.identifier,
+				IssueID:         "id-1",
+				WorkspaceSlug:   "ws",
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestSendMentionNotificationEmail_AppURLFallback(t *testing.T) {
+	tests := []struct {
+		name           string
+		appURL         string
+		frontendOrigin string
+	}{
+		{
+			name:   "MULTICA_APP_URL takes precedence",
+			appURL: "https://custom.multica.ai",
+		},
+		{
+			name:           "falls back to FRONTEND_ORIGIN",
+			frontendOrigin: "https://frontend.multica.ai",
+		},
+		{
+			name: "defaults to https://multica.ai when both unset",
+		},
+		{
+			name:   "trailing slash stripped",
+			appURL: "https://custom.multica.ai/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("MULTICA_APP_URL", tt.appURL)
+			t.Setenv("FRONTEND_ORIGIN", tt.frontendOrigin)
+			s := &EmailService{}
+			err := s.SendMentionNotificationEmail(MentionNotification{
+				To:              "user@example.com",
+				MentionerName:   "Alice",
+				IssueTitle:      "Test",
+				IssueIdentifier: "WS-1",
+				IssueID:         "issue-uuid",
+				WorkspaceSlug:   "myws",
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestSendMentionNotificationEmail_EmptyFields(t *testing.T) {
+	tests := []struct {
+		name         string
+		notification MentionNotification
+	}{
+		{
+			name: "empty mentioner name",
+			notification: MentionNotification{
+				To:              "user@example.com",
+				IssueTitle:      "Title",
+				IssueIdentifier: "WS-1",
+				IssueID:         "id",
+				WorkspaceSlug:   "ws",
+			},
+		},
+		{
+			name: "empty issue title",
+			notification: MentionNotification{
+				To:              "user@example.com",
+				MentionerName:   "Alice",
+				IssueIdentifier: "WS-1",
+				IssueID:         "id",
+				WorkspaceSlug:   "ws",
+			},
+		},
+		{
+			name: "empty identifier",
+			notification: MentionNotification{
+				To:              "user@example.com",
+				MentionerName:   "Alice",
+				IssueTitle:      "Title",
+				IssueID:         "id",
+				WorkspaceSlug:   "ws",
+			},
+		},
+		{
+			name: "empty workspace slug",
+			notification: MentionNotification{
+				To:              "user@example.com",
+				MentionerName:   "Alice",
+				IssueTitle:      "Title",
+				IssueIdentifier: "WS-1",
+				IssueID:         "id",
+			},
+		},
+		{
+			name: "all fields empty except To",
+			notification: MentionNotification{
+				To: "user@example.com",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("MULTICA_APP_URL", "https://app.multica.ai")
+			s := &EmailService{}
+			err := s.SendMentionNotificationEmail(tt.notification)
+			if err != nil {
+				t.Fatalf("should not error on empty fields: %v", err)
+			}
+		})
+	}
+}
+
+func TestSendMentionNotificationEmail_UnicodeContent(t *testing.T) {
+	t.Setenv("MULTICA_APP_URL", "https://app.multica.ai")
+	s := &EmailService{}
+	err := s.SendMentionNotificationEmail(MentionNotification{
+		To:              "user@example.com",
+		MentionerName:   "张三",
+		IssueTitle:      "修复订单模块新增分期付款功能的 Bug 🐛",
+		IssueIdentifier: "WS-42",
+		IssueID:         "uuid-test",
+		WorkspaceSlug:   "team-workspace",
+	})
+	if err != nil {
+		t.Fatalf("should handle unicode content without error: %v", err)
+	}
+}
+
+func TestSendMentionNotificationEmail_SMTPDelivery(t *testing.T) {
+	t.Setenv("MULTICA_APP_URL", "https://app.multica.ai")
+	srv, cleanup := startTestSMTPServer(t, testSMTPServer{
+		AuthMechs:    "PLAIN",
+		ExpectedUser: "user",
+		ExpectedPass: "pass",
+	})
+	defer cleanup()
+	host, port, _ := net.SplitHostPort(srv.Addr)
+
+	s := &EmailService{
+		fromEmail:    "noreply@multica.ai",
+		smtpHost:     host,
+		smtpPort:     port,
+		smtpUsername: "user",
+		smtpPassword: "pass",
+	}
+
+	err := s.SendMentionNotificationEmail(MentionNotification{
+		To:              "recipient@example.com",
+		MentionerName:   "Alice",
+		IssueTitle:      "Important task",
+		IssueIdentifier: "WS-99",
+		IssueID:         "abc-def-ghi",
+		WorkspaceSlug:   "acme",
+	})
+	if err != nil {
+		t.Fatalf("SMTP delivery failed: %v", err)
+	}
+}
+
+func TestSendMentionNotificationEmail_SMTPFailsGracefully(t *testing.T) {
+	t.Setenv("MULTICA_APP_URL", "https://app.multica.ai")
+	s := &EmailService{
+		fromEmail: "noreply@multica.ai",
+		smtpHost:  "255.255.255.255",
+		smtpPort:  "25",
+	}
+
+	err := s.SendMentionNotificationEmail(MentionNotification{
+		To:              "user@example.com",
+		MentionerName:   "Alice",
+		IssueTitle:      "Test",
+		IssueIdentifier: "WS-1",
+		IssueID:         "id",
+		WorkspaceSlug:   "ws",
+	})
+	if err == nil {
+		t.Fatal("expected error from unreachable SMTP server")
+	}
+}
+
+func TestSendMentionNotificationEmail_MissingFromEmail(t *testing.T) {
+	t.Setenv("MULTICA_APP_URL", "https://app.multica.ai")
+	s := &EmailService{
+		smtpHost: "127.0.0.1",
+		smtpPort: "25",
+	}
+
+	err := s.SendMentionNotificationEmail(MentionNotification{
+		To:              "user@example.com",
+		MentionerName:   "Alice",
+		IssueTitle:      "Test",
+		IssueIdentifier: "WS-1",
+		IssueID:         "id",
+		WorkspaceSlug:   "ws",
+	})
+	if err == nil {
+		t.Fatal("expected error when SMTP from email is missing")
+	}
+	if !strings.Contains(err.Error(), "SMTP_FROM_EMAIL or RESEND_FROM_EMAIL") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
